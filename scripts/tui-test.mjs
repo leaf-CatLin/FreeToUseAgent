@@ -74,13 +74,14 @@ globalThis.setTimeout = realSetTimeout
 check('apply() survives a composition with no web server', bootError?.message ?? 'none', 'none')
 const adapter = ctx.__captured.adapters[0]?.adapter
 check('the adapter still registers', typeof adapter?.listModels, 'function')
-check('the probe loop and the egress watch armed on plain timers', armed.sort((a, b) => a - b), [120_000, 900_000, 1_800_000])
-check('the probe loop and the egress watch armed on plain timers', armed.sort((a, b) => a - b), [120_000, 900_000, 1_800_000])
-// Compared by period, not by count: `armed` holds the three long loops while
-// `unrefed` also holds the 40-second and 50-millisecond one-shots, so a count
-// comparison stayed true after any one of the three stopped unref'ing itself —
-// which is the one property that decides whether the plugin can hold the app
-// open past exit.
+// Two long loops now, not three: this adaptation ships no announcement channel,
+// so the 30-minute feed poll is gone. The probe loop (15 min) and the egress
+// watch (2 min) are the whole set, and they stay identical in both modes.
+check('the probe loop and the egress watch armed on plain timers', armed.sort((a, b) => a - b), [120_000, 900_000])
+// Compared by period, not by count: `unrefed` also holds the one-shots, so a
+// count comparison stayed true after any one of the loops stopped unref'ing
+// itself — which is the one property that decides whether the plugin can hold
+// the app open past exit.
 check('and every one of them is unref’d, so the plugin cannot hold the app open',
   armed.filter(ms => !unrefed.includes(ms)), [])
 check('the dashboard half is the only thing left waiting', ctx.__captured.serverRoutes.length, 0)

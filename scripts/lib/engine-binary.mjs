@@ -6,8 +6,7 @@
  * Linux, so any suite that starts the real engine has nothing to start there.
  * Those suites are integration checks against a binary, not unit checks of the
  * plugin's own code, so the honest answer on a platform with no binary is to
- * say so and skip — the same convention `standalone-page-lifecycle-test.mjs`
- * uses when its compiler is absent.
+ * say so and skip.
  *
  * This is deliberately a *platform* gate and not a silent catch: a platform
  * that does have a binary but whose bytes do not match the manifest is a real

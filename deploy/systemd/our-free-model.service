@@ -1,0 +1,51 @@
+[Unit]
+Description=Our Free Model standalone (LAN inference relay, loopback management)
+Documentation=https://github.com/Ebony-Vinyl/dsh-our-free-model
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 按实际用户与路径修改。
+User=ofm
+Group=ofm
+WorkingDirectory=/opt/dsh-our-free-model
+Environment=OFM_HOME=/srv/ofm/data
+Environment=NODE_ENV=production
+# --lan 会把 LAN 意愿写进 settings.json，重启后仍然生效。
+# --lan-port 是期望端口；0 表示每次启动自动分配。
+ExecStart=/usr/bin/node /opt/dsh-our-free-model/packages/standalone/cli.mjs \
+    --data-dir /srv/ofm/data --port 18900 --lan --lan-port 18901
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+# 优雅退出依赖 SIGTERM：cli.mjs 监听 SIGINT/SIGTERM 并释放端口与 service.lock。
+KillSignal=SIGTERM
+KillMode=mixed
+
+# ── 收紧权限 ────────────────────────────────────────────────────────────────
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+# 只有数据目录可写；凭据与 settings.json 都在这里。
+ReadWritePaths=/srv/ofm/data
+# 服务不申请任何特权端口。
+AmbientCapabilities=
+CapabilityBoundingSet=
+
+# 日志走 journald。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=our-free-model
+
+[Install]
+WantedBy=multi-user.target

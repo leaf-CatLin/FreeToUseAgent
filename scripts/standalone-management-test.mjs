@@ -114,27 +114,28 @@ try {
     assert.match(page.headers.get('content-security-policy'), /frame-ancestors 'none'/)
     assert.equal(page.headers.get('referrer-policy'), 'no-referrer')
     const body = await page.text()
-    assert.match(body, /本地控制台/)
+    assert.match(body, /Our Free Model/)
     assert.match(page.headers.get('content-security-policy'), /script-src 'self';/)
     const scripts = [...body.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)]
     assert.ok(scripts.length > 0)
     assert.ok(scripts.every(([, attributes, content]) => /\bsrc=/.test(attributes) && !content.trim()),
       '管理页脚本必须通过同源外部资源加载，不能依赖被 CSP 禁止的内联脚本')
     const platform = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'unsupported'
-    assert.ok(body.includes(`data-login-platform="${platform}"`))
     assert.ok(!body.includes(key))
-    const manifest = JSON.parse(fs.readFileSync(new URL('../packages/standalone/web/assets.json', import.meta.url), 'utf8'))
-    assert.ok(manifest.includes('app.js') && manifest.includes('app.css'))
-    assert.ok(manifest.some(name => /^channels-.+\.js$/.test(name)))
-    for (const asset of manifest) {
+    // The console is a closed set of hand-written files; there is no build
+    // manifest. Every one of them is served, contains no key, and refuses
+    // anything but GET/HEAD.
+    const consoleAssets = ['console.js', 'console.css', 'icon.svg']
+    for (const asset of consoleAssets) {
       const response = await request(`/assets/${asset}`, { cookie: '' })
       assert.equal(response.status, 200, asset)
-      assert.match(response.headers.get('content-type'), asset.endsWith('.css') ? /text\/css/ : /javascript/)
+      assert.match(response.headers.get('content-type'), asset.endsWith('.css') ? /text\/css/ : asset.endsWith('.svg') ? /svg/ : /javascript/)
       assert.ok(!(await response.text()).includes(key), asset)
       assert.equal((await request(`/assets/${asset}`, { method: 'HEAD' })).status, 200)
       assert.equal((await request(`/assets/${asset}`, { method: 'POST' })).status, 405)
     }
-    for (const route of ['/assets/settings.json', '/assets/assets.json', '/assets/unknown.js', '/frontend/app.tsx', '/assets/%2e%2e%2fservice.mjs']) {
+    // Anything outside that set is not a disk read, even with a valid key.
+    for (const route of ['/assets/settings.json', '/assets/assets.json', '/assets/unknown.js', '/frontend/app.tsx', '/assets/%2e%2e%2fservice.mjs', '/assets/console.js.map']) {
       assert.equal((await request(route, { cookie: '', headers: { authorization: `Bearer ${key}` } })).status, 404, route)
     }
     const health = await (await request('/health')).json()

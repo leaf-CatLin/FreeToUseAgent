@@ -32,6 +32,33 @@ npm run start:standalone -- --port 18900 --data-dir F:\ofm-data
   EAC 授权保存在 `eac-user.json`，均属于当前独立数据目录。
 - 首次启动不会自动搬迁插件账号。需要迁移时，在插件中导出账号备份，再在独立网页的
   “免费账号渠道 → 供应商与备份”手动导入。备份包含明文凭据，请妥善保存。
+  也可以在**服务未运行**时用命令行直读 dsh 数据目录迁移，见下文「从 dsh 迁移凭据」。
+
+## 从 dsh 迁移凭据（本改编版新增）
+
+```powershell
+node packages/standalone/cli.mjs --import-dsh [--dsh-home <目录>] [--data-dir <目录>] [--out <文件>] [--with-ledger] [--replace] [--dry-run]
+node packages/standalone/cli.mjs --import-backup <文件> [--data-dir <目录>] [--replace] [--dry-run]
+node packages/standalone/cli.mjs --export-backup <文件> [--data-dir <目录>] [--force]
+```
+
+| 参数 | 含义 |
+| --- | --- |
+| `--import-dsh` | 读 `<dsh>/.credentials.yaml` 的 `refs:` 与 `<dsh>/channel-pack/`，写入本服务凭据库；不需要 dsh 在运行 |
+| `--dsh-home <目录>` | dsh 数据目录，省略时取 `$DSH_HOME`，再缺省 `~/.dsh` |
+| `--out <文件>` | 迁移同时落盘一份标准备份 JSON |
+| `--with-ledger` | 附带迁移积分账本与签到文件 |
+| `--replace` | 整体覆盖既有凭据与账号池（默认合并） |
+| `--dry-run` | 只报告计数，不写文件 |
+
+- 只迁移十个账号渠道的凭据（`*_ACCOUNT_*`）与账号池；平台 Key、平台授权与 EAC 授权不导出。
+- 迁移动作**不启动服务、不取锁、不监听端口**，执行完退出；服务在运行时（存在
+  `service.lock`）会被拒绝。
+- dsh 文件只读；终端输出只含计数与路径，绝不含凭据值。
+- 退出码：`0` 成功，`1` 运行期失败（找不到文件、版本不支持、目标已有凭据等），
+  `2` 迁移动作互斥或与启动选项混用。
+- 完整字段语义、失败码与安全约定见仓库
+  [`docs/standalone-dsh-migration.md`](../../docs/standalone-dsh-migration.md)。
 - API Key 为此产品单独生成，保存在该目录的 `settings.json` 的 `forwardKey` 字段。
 - `GET /health` 提供不含凭据的产品状态；推理接口与模型清单需要 `Authorization: Bearer <API Key>`。
 - 同一个数据目录只能启动一个本地服务实例。正常退出会清除 `service.lock`。
@@ -51,16 +78,26 @@ npm run start:standalone -- --no-lan
 ```
 
 `--lan-port` 单独使用只保存端口，不启用中继。省略开关时沿用已保存设置。
-中继监听 `0.0.0.0`，仅转发模型清单及 Chat Completions、Responses、Messages、
-Messages count_tokens 推理路径（支持 `/v1` 前缀和无前缀形式）。
+中继监听 `0.0.0.0`，仅转发白名单里的推理路径：
+模型清单（`/v1/models`、`/models`、`/v1beta/models`、`/api/tags`）、
+Chat Completions、Responses、Messages、Messages count_tokens、
+Gemini 的 `:generateContent` / `:streamGenerateContent` / `:countTokens`、
+Ollama 的 `/api/chat` 与 `/api/generate`（支持 `/v1` 前缀和无前缀形式）。
+Gemini 的单模型路径按锚定正则匹配，不做百分号解码，`..` 与 `%2f` 直接不匹配。
 流式响应与取消沿用本机推理实现。`/`、`/health`、页面资源和所有管理路径均不转发；
 OPTIONS 只返回 CORS 预检，不返回管理数据。
+
+中继在接受 LAN Key 后**把它剥掉**再转发：`Authorization` 换成回环密钥，
+`x-api-key` 与 `x-goog-api-key` 请求头被删除，Gemini 的 `?key=` 查询参数也被移除。
+因此 LAN Key 既不会出现在本机监听器的请求行，也不会进它的日志。
 
 LAN 客户端使用本机管理接口单独生成的 LAN Key，不能使用或索取本机 `forwardKey`。
 LAN Key 保存在当前独立目录的 `settings.json` 的 `standaloneLanKey` 字段中；
 关闭中继、正常退出和重启均保留该密钥。轮换 LAN Key 立即使旧 LAN Key 失效，
 本机 API Key 和管理会话继续可用。轮换本机 API Key 后中继自动使用新本机密钥。
 只把 LAN Key 交给可信客户端，并在需要时通过防火墙限制访问来源。
+无图形界面的服务器可以加 `--lan-key-out <文件>`：服务启动后把 Key 以 0600 写入该文件
+（不打印到 stdout）。托管产物（systemd / Windows 任务计划 / Docker）见仓库 `deploy/`。
 
 本机管理 API 使用已有会话或本机 Bearer Key，契约如下：
 
@@ -97,8 +134,9 @@ LAN Key 保存在当前独立目录的 `settings.json` 的 `standaloneLanKey` �
   Qoder、Qoder 中国版、TRAE、Cline、Loomy、Raccoon、MiniMax Code、ZCode、Gemini
 - 原渠道登录、账号池和轮换、续期、模型开关、每日签到、积分锁定、账本及备份
 - 本地模型缓存、用量统计、周期刷新、请求取消与退出清理
-- `GET /`：独立中文网页控制台
-- `/api/management/*`：同源管理接口，使用管理会话或 API Key 鉴权
+- `GET /`：独立网页管理台（零依赖，无构建步骤）
+- `/api/management/*`：同源管理接口，使用管理会话（Cookie）鉴权；
+  凭据迁移接口额外要求管理密钥会话
 
 启动先绑定监听器，再异步刷新模型清单。首次运行默认不发可用性探测请求；
 `--probe` 可启用并保存自动探测设置，以后启动沿用，可在网页设置中关闭。
@@ -114,73 +152,30 @@ EAC 在独立页面自行授权；不会使用 DSH 的 EAC token。原插件的�
 
 ## 网页管理
 
-独立端已更新概览、渠道管理、模型清单、用量统计、服务设置和公共导航；
-API 接入和登录继续保留已有控制逻辑。资源全部由本机服务提供，
-渠道、模型、用量统计和服务设置按需加载，不依赖 CDN。
-管理导航新增「插件中心」：渠道、增强与页面插件共用一套签名清单、权限与沙箱，
-侧边栏会动态出现插件贡献的页面（`sandbox="allow-scripts"` iframe + 受控消息桥）；
-内置的账号渠道包、聚合渠道目录、客户端启动器、资源库格式与模型工作台
-也以 built-in 插件登记在同一中心，不可卸载。开发者模式可安装本地未签名包，
-需要显式确认且带「未验证」徽标。详见 [`插件平台`](../../docs/plugin-platform.md)
-与 [`页面插件 API`](../../docs/plugin-page-api.md)。视觉与体积记录见
-[`第一阶段验收`](../../docs/verification/2026-10-09-standalone-ui-phase1.md)、
-[`模型清单验收`](../../docs/verification/2026-10-09-standalone-model-browser.md)和
-[`用量统计验收`](../../docs/verification/2026-10-09-standalone-usage-dashboard.md)和
-[`服务设置验收`](../../docs/verification/2026-10-09-standalone-settings-page.md)。
+管理台是 `console/` 目录下三个手写文件（`index.html`、`console.css`、`console.js`）
+加仓库根 `icon.svg`，由本机服务直接提供，没有构建步骤、不依赖 React/Vite 和任何 CDN。
+修改这三个文件后重启服务即可生效。页面结构为四个标签页：
 
-修改前端后，在仓库根目录执行：
+- **概览**：本机 API 地址、数据目录、模型总数、局域网中继状态、今日用量。
+- **迁移凭据**：从 dsh 数据目录导入已有登录凭据（演练/整体覆盖/附带积分账本）、
+  导出当前账号池为备份文件、或导入 `channel-pack/backup` 备份文件。
+- **局域网与密钥**：启用/保存 LAN 推理中继与期望端口，查看并轮换本机 API Key 与 LAN Key，
+  接入地址与 curl 示例。
+- **模型与试算**：模型清单搜索/刷新，以及用 OpenAI / Anthropic / Gemini / Ollama
+  四种协议在线试算。
 
-```powershell
-npm ci --prefix packages/standalone --ignore-scripts
-npm run typecheck:standalone
-npm run build:standalone-ui
-node scripts/build-standalone-ui.mjs --check
-```
+管理会话是一次性登录链接或管理密钥换取的 HttpOnly、SameSite=Strict Cookie；
+重启服务或退出管理会清除会话。用本机 API Key（`forwardKey`）也能登录，
+但读取、导入与导出凭据的接口会拒绝它——只有一次性链接或 `settings.json` 里的
+`managementKey` 建立的会话可以操作凭据。试算接口不读凭据，本机 Key 即可使用。
 
-`frontend/` 是源码，`web/` 是提交的构建输出。服务启动时载入这些资源；
-重新构建后需要重启服务。开发工具只用于构建，不作为网页资源公开。
+页面每 20 秒在可见时刷新一次状态，读取状态不发送推理请求。密钥只在浏览器的
+内存中展示，不写入 localStorage 或 URL；显示/复制/轮换均需点击按钮触发。
+试算默认限制 4096 个输出 Token，通过回环 HTTP 以所选协议的真实请求发往推理端口，
+未选模型或服务暂停时给出可读错误。试算与刷新会消耗上游额度，请勿发送敏感内容。
 
-模型页使用 TanStack Virtual 按可视区域挂载条目，支持动态行高和长 ID 换行。
-聚焦滚动区域后可按 Home/End 到达首尾；复制或测试按钮获得焦点时保留所在条目。
-搜索和筛选只改变当前视图，刷新及切页后保留，退出管理后清空。
-单模型测试可取消；切页或退出时中断测试请求。刷新和探测属于服务端共享任务，
-离开页面会取消前端等待，不承诺停止服务端整个刷新任务。
-
-- **概览**：推理状态、接入地址、模型数量、最近 7 天 Token 用量和本机服务信息。
-- **模型清单**：名称/ID 搜索、渠道/能力/状态/公开范围组合筛选、复制模型 ID、
-  刷新清单、主动探测，以及可取消的单模型测试和结果展示。
-- **用量统计**：累计用户回合、物理请求、输入/输出 Token、失败与恢复回合，
-  最近 7/14/30 个本地自然日趋势（默认 14 天），以及按模型搜索、排序和每页 20 条统计。
-  历史估算有明确说明，未知性能显示“—”；读取和刷新统计不发送推理请求。
-- **免费账号渠道**：十张渠道卡片、登录与账号管理；渠道用量、请求日志、
-  供应商启停、永久积分锁定、昵称、账号优先级、限流重置与备份导入导出。
-- **EAC 协付渠道**：GitHub 授权、状态、取消、退出和资源池。授权页面由用户打开并完成。
-- **服务设置**：暂停或恢复推理、地区模型、断流恢复、输出上限、刷新间隔和自动探测。
-- **API 接入**：复制地址、主动查看或隐藏密钥、复制调用示例、确认后轮换密钥。
-
-登录链接的临时凭证位于 URL fragment，页面兑换后移除。浏览器使用 8 小时有效的
-HttpOnly、SameSite=Strict 管理 Cookie；重启服务或退出管理会清除会话。
-链接已使用或过期时，可用 `settings.json` 中的 `forwardKey` 登录。
-登录页提供本机获取令牌入口：Windows 打开 PowerShell，macOS 打开系统 Terminal，
-读取当前服务实际数据目录中的密钥并复制到剪贴板，再回页面粘贴登录。
-该操作只接受本机页面的同源请求，只执行固定动作，不接受网页提供的命令或路径，
-也不会把密钥返回给未登录的网页。每次成功打开后 30 秒内不能重复打开。
-打开失败时，可展开「手动获取与其他系统」，复制当前系统默认目录的取令牌命令，
-或直接从配置文件读取 `forwardKey`；自定义目录以启动参数为准。
-macOS 首次打开可能需要允许本地服务控制 Terminal。Linux 使用手动说明
-或服务启动时打印的一次性登录链接；Windows 和 macOS 也保留这些备用入口。
-轮换密钥会立即使旧密钥及其他管理会话失效，当前管理会话保留，客户端需更新配置。
-推理接口仍要求 Bearer API Key，管理 Cookie 不能用于推理。暂停推理后管理页面仍可访问。
-
-页面每 15 秒更新状态，读取状态不发送推理请求。主动探测和模型测试会消耗上游额度；
-模型测试限制 64 个输出 Token、60 秒超时，真实用量计入统计。
-统计保存用量与性能，不保存提示词和回答；推理内容仍发送至模型上游，
-Kilo 免费池的提示词可能被上游记录，请勿发送敏感内容。
-
-服务设置有未保存提示、数字范围校验和撤销修改。后台轮询及切页不会覆盖编辑草稿，
-退出管理后草稿清空；撤销恢复最近同步的已保存值。保存期间禁止重复提交，
-失败时保留输入，保存成功以服务端返回值为准。自动探测开关仍控制原有周期任务；
-以 `--no-refresh` 启动时，保存设置不会恢复自动任务。
+此前的 React 管理台（`frontend/` + `web/` 构建产物、TanStack 虚拟列表、插件中心、
+EAC 协付页面等）已在本改编版中整体移除，由上述零依赖页面取代。
 
 ## Gemini 与 Cline 网络连接
 
@@ -203,8 +198,11 @@ npm run test:contributor
 两个 API 协议、流式响应、缓存、并发刷新、退出清理及进程级 DSH 依赖隔离。
 管理专项测试覆盖会话、同源防护、设置校验与持久化、暂停后恢复、模型操作、
 密钥轮换、重启与自动刷新调度；浏览器验收使用独立数据目录和本机上游替身。
-渠道专项运行真实适配器与原授权逻辑，网络重定向至本机替身，覆盖多实例隔离、
-工具和图片、Chat/Responses、积分锁定、备份、用量、取消与退出。未逐家验收外部真实账号登录。
+管理台专项测试（`scripts/console-test.mjs`）覆盖静态资源封闭集合、管理密钥会话
+权限边界、迁移三入口（dsh 演练/整体覆盖、备份导入校验、导出落盘）、LAN 设置与
+四条协议的试算链路。渠道专项运行真实适配器与原授权逻辑，网络重定向至本机替身，
+覆盖多实例隔离、工具和图片、Chat/Responses、积分锁定、备份、用量、取消与退出。
+未逐家验收外部真实账号登录。
 
 加载本机替身的验收进程会在管理摘要中标记 `networkMode: fixture`，网页显示醒目的测试提示。
 替身进程不能用于真实账号登录；实际使用应按上方命令启动独立服务，
@@ -217,10 +215,9 @@ npm run test:contributor
 ```powershell
 npm ci --prefix packages/standalone --ignore-scripts
 npm run build:standalone-channels
-npm run build:standalone-ui
 node scripts/build-standalone-channels.mjs --check
-node scripts/build-standalone-ui.mjs --check
 ```
 
-生成器只替换平台承载及页面连接方式，不修改原插件的 `client.js` 与渠道包。
+管理台没有构建步骤（`console/` 三文件直接由服务提供）；渠道产物生成器只替换
+平台承载及页面连接方式，不修改原插件的 `client.js` 与渠道包。
 原渠道的 WASM 和共享核心仍来自完整仓库；单独复制本目录不能运行。

@@ -24,16 +24,12 @@ export function stageDesktopService(destination, { requireWorkspace = false } = 
     }
   }
   tree('src', file => /\.(js|json)$/.test(file))
-  for (const name of ['cli', 'service', 'management', 'desktop-update', 'login-terminal', 'open-external', 'eac', 'workbench', 'providers', 'library', 'client-terminal', 'routing', 'feedback']) copy(`packages/standalone/${name}.mjs`)
+  for (const name of ['cli', 'service', 'management', 'desktop-update', 'login-terminal', 'open-external', 'eac', 'workbench', 'providers', 'library', 'client-terminal', 'routing', 'feedback', 'dsh-migrate', 'yaml-refs']) copy(`packages/standalone/${name}.mjs`)
   tree('packages/standalone/channels', file => file.endsWith('.mjs'))
-  const web = 'packages/standalone/web'
-  const assets = JSON.parse(fs.readFileSync(path.join(repositoryRoot, web, 'assets.json'), 'utf8'))
-  if (!Array.isArray(assets) || assets.length === 0
-    || assets.some(name => typeof name !== 'string' || !/^[\w-]+\.(js|css)$/.test(name))
-    || new Set(assets).size !== assets.length) {
-    throw new Error('桌面端资源清单无效')
-  }
-  for (const name of ['index.html', 'splash.html', 'assets.json', ...assets]) copy(`${web}/${name}`)
+  // The console is three hand-written files plus the shared icon: there is no
+  // build output and no asset manifest to read.
+  for (const name of ['index.html', 'console.css', 'console.js']) copy(`packages/standalone/console/${name}`)
+  copy('icon.svg')
   copy('packages/standalone/package.json')
   copy('packages/desktop/service-host.mjs')
   for (const name of ['qoder-auth-wasm.wasm', 'LICENSE', 'NOTICE.md']) copy(`vendor/channel-pack/${name}`)

@@ -1637,15 +1637,10 @@ export function apply(ctx, config) {
     })().catch(error => logger.warn?.(`our-free-model: startup refresh failed (${error?.message ?? error})`))
   }, 'our-free-model: boot refresh')
 
-  // Feed poll: shortly after boot, then on the configured period. Concurrency
-  // with a manual refresh is harmless — polls share one in-flight request.
-  // A managed install polls nothing: the pack speaks for the plugin.
-  ctx.effect(() => {
-    if (managed) return
-    const first = setTimeout(() => { void feed.poll() }, 12_000)
-    first.unref?.()
-    return () => clearTimeout(first)
-  }, 'our-free-model: first feed poll')
+  // No boot-time announcement poll: this adaptation ships no announcement
+  // channel (DEFAULT_FEED_SOURCES is empty). The settings page still renders the
+  // (empty) list, and a self-hosted mirror opted into with `feedUrl` is refreshed
+  // only when the user presses refresh.
 
   /**
    * Run one task every `ms` for as long as this generation lives.
@@ -1676,13 +1671,10 @@ export function apply(ctx, config) {
     ctx.effect(() => () => clearTimeout(handle), 'our-free-model: interval')
   }
 
-  if (!managed) {
-    every(() => {
-      void feed.poll()
-      const hours = settings.get().updateCheckHours ?? 6
-      if (hours > 0) void updater.check().then(() => pushUpdate(false)).catch(() => {})
-    }, () => positiveOr(settings.get().feedPollMinutes, 30, 5) * 60_000)
-  }
+  // No announcement poll and no update check: this adaptation ships an empty feed
+  // source list and an empty manifest source list (see src/feed.js and
+  // src/updater.js), so a loop here would only ever tick a timer and produce a
+  // failure. Deployments update by pulling this repository and restarting.
   // Automatic availability probing is disabled by owner policy. This loop only
   // refreshes the listing and reads the egress; the interval keeps its setting
   // name for upgrade compatibility. `/reprobe` is the only path that still asks
@@ -1712,19 +1704,6 @@ export function apply(ctx, config) {
         egressWarned = true
       })
   }, 120_000)
-  // The first update check waits for the boot refresh to settle, then runs once
-  // even when the periodic poll is disabled (hours === 0 means opt out fully).
-  // Managed installs check nothing — the pack that installed them decides.
-  ctx.effect(() => {
-    if (managed) return
-    const first = setTimeout(() => {
-      const hours = settings.get().updateCheckHours ?? 6
-      if (hours <= 0) return
-      void updater.check().then(() => pushUpdate(false)).catch(() => {})
-    }, 40_000)
-    first.unref?.()
-    return () => clearTimeout(first)
-  }, 'our-free-model: first update check')
 
   // Keep the module-level "notified" marker in sync with the stored one so a
   // reload does not re-toast the same version.

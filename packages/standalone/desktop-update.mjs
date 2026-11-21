@@ -1,10 +1,15 @@
-/** 桌面更新只下载本仓库正式安装包；安装交接留给原生窗口。 */
+/** 桌面更新只下载本仓库正式安装包；安装交接留给原生窗口。
+ *
+ * 本改编版不发布桌面安装包，也没有对应的 release 源：`REPO` 为空时
+ * `supported` 恒为 false，`check()` 与 `download()` 都以明确的 503 拒绝，
+ * 不会去任何上游 releases 下载安装包覆盖本地代码。 */
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { mkdir, open, rename, unlink } from 'node:fs/promises'
 
-const REPO = 'Ebony-Vinyl/dsh-our-free-model'
+/** 空的发布源：本改编版没有桌面安装包渠道。 */
+const REPO = ''
 const MAX_INSTALLER = 256 * 1024 * 1024
 const allowedHosts = new Set(['api.github.com', 'github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com'])
 const fail = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode })
@@ -48,7 +53,8 @@ export function installerChecksum(text, name) {
 }
 
 export function createDesktopUpdater({ dataDir, version, platform = process.platform, arch = process.arch, fetchImpl = fetch }) {
-  const supported = platform === 'win32' && arch === 'x64' && versionParts(version) !== null && typeof dataDir === 'string' && path.isAbsolute(dataDir)
+  // 没有发布源就没有可更新目标：即使平台匹配也按不支持处理，避免任何下载路径。
+  const supported = REPO !== '' && platform === 'win32' && arch === 'x64' && versionParts(version) !== null && typeof dataDir === 'string' && path.isAbsolute(dataDir)
   const directory = path.join(dataDir ?? '.', 'desktop-updates')
   let snapshot = { currentVersion: version ?? '', supported, phase: 'idle', latest: null, available: false,
     checkedAt: null, received: 0, total: 0, error: '' }
@@ -87,7 +93,7 @@ export function createDesktopUpdater({ dataDir, version, platform = process.plat
   }
   const begin = (phase, run) => {
     if (closed) throw fail('更新管理已关闭', 503)
-    if (!supported) throw fail('当前仅支持 Windows x64 桌面客户端更新')
+    if (!supported) throw fail('当前版本不提供桌面更新通道', 503)
     if (active) throw fail('已有更新操作正在进行', 409)
     controller = new AbortController()
     snapshot = { ...snapshot, phase, error: '' }
@@ -123,6 +129,9 @@ export function createDesktopUpdater({ dataDir, version, platform = process.plat
         checkedAt: Date.now(), available: !!candidate && newerVersion(candidate.version, version), received: 0, total: 0 }
     }) },
     download() {
+      // This build has no desktop release channel at all, so answer that first:
+      // "nothing to download" is a capability answer, not a usage error.
+      if (!supported) throw fail('当前版本不提供桌面更新通道', 503)
       if (!candidate || !newerVersion(candidate.version, version)) throw fail('请先检查并找到可更新的桌面版本')
       const selected = candidate
       return begin('downloading', async () => {

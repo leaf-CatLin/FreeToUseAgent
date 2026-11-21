@@ -121,7 +121,6 @@ const suites = [
   'scripts/magpie-models-test.mjs',
   'scripts/magpie-policy-test.mjs',
   'scripts/magpie-plugin-test.mjs',
-  'scripts/engine-payload-test.mjs',
 ]
 
 const args = process.argv.slice(2)

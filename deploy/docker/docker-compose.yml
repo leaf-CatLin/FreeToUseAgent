@@ -1,0 +1,32 @@
+# Our Free Model 独立服务（局域网推理）
+#
+#   docker compose -f deploy/docker/docker-compose.yml up -d
+#
+# 构建上下文是仓库根目录，所以这个文件要放在仓库里运行。
+services:
+  our-free-model:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: ofm-standalone:local
+    container_name: ofm
+    restart: unless-stopped
+    ports:
+      # 管理台只绑宿主机回环：需要管理时在本机浏览器打开 http://127.0.0.1:18900
+      - "127.0.0.1:18900:18900"
+      # 局域网推理中继
+      - "18901:18901"
+    volumes:
+      # 数据卷里有 settings.json 与明文凭据，只有容器内 node 用户可读。
+      - ofm-data:/data
+    environment:
+      OFM_HOME: /data
+    # 服务自己会优雅处理 SIGTERM 并释放 service.lock 与端口。
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  ofm-data:
+    # 显式命名，方便备份/迁移：docker volume inspect <项目名>_ofm-data
+    name: ofm-data

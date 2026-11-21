@@ -8,9 +8,10 @@
  * against the gateway is separate and costs minutes and quota, so it stays a
  * deliberate act: `node scripts/host-selftest.mjs`.
  *
- * The default includes the manifest check because shipping a manifest that
- * disagrees with its files breaks the in-app upgrade for every user at once
- * (issue #1), and nothing else fails when that happens.
+ * This adaptation ships no release pipeline: there is no manifest, no catalog
+ * record and no signed release set, so `--mode release` reduces to the offline
+ * bundle check. The two suites this fork added (`dsh-migrate`, `protocols`) run
+ * in every mode.
  */
 import { spawn } from 'node:child_process'
 import path from 'node:path'
@@ -31,21 +32,13 @@ if (!['all', 'contributor', 'release'].includes(options.mode)) {
   process.exit(1)
 }
 const { mode, only } = options
-const releaseSuites = new Set(['manifest', 'legacy-payload', 'release', 'catalog', 'legacy-upgrade', 'engine-payload'])
+const releaseSuites = new Set(['legacy-payload'])
 
 const suites = [
-  ['manifest', 'build-manifest.mjs', ['--check']],
-  // The shipped bundles (token-saver, o2a, core) and the engine parts must
-  // match their sources; a stale src/o2a.js would make every suite below test
-  // yesterday's shaping while src/o2a/ already looks updated.
+  // The shipped bundles (token-saver, o2a, core) must match their sources; a
+  // stale src/o2a.js would make every suite below test yesterday's shaping while
+  // src/o2a/ already looks updated.
   ['legacy-payload', 'build-legacy-payload.mjs', ['--check']],
-  ['release', 'release-e2e.mjs', []],
-  ['legacy-upgrade', 'legacy-upgrade-test.mjs', mode === 'contributor' ? [] : ['--production']],
-  ['engine-payload', 'engine-payload-test.mjs', []],
-  ['release-preparation', 'release-preparation-test.mjs', []],
-  // The npm channel is a rename of this tree; a missed registration literal
-  // ships a package whose two halves mount under different names (#725/#835).
-  ['scoped-publish', 'scoped-publish-test.mjs', []],
   ['client-lint', 'client-lint.mjs', []],
   ['sponsor', 'sponsor-test.mjs', []],
   ['heatmap', 'heatmap-test.mjs', []],
@@ -94,17 +87,17 @@ const suites = [
   ['desktop', 'desktop-test.mjs', []],
   ['desktop-update', 'desktop-update-test.mjs', []],
   ['standalone-desktop-regression', 'standalone-desktop-regression-test.mjs', []],
-  ['standalone-page-lifecycle', 'standalone-page-lifecycle-test.mjs', []],
   ['standalone-management', 'standalone-management-test.mjs', []],
   ['standalone-lan', 'standalone-lan-test.mjs', []],
-  ['standalone-frontend', 'standalone-frontend-test.mjs', []],
-  ['standalone-client-regression', 'standalone-client-regression-test.mjs', []],
+  // The adaptation's own suites: the dsh credential migration and the
+  // multi-protocol surface (Ollama plus the relay's Gemini/`/api` whitelist).
+  ['dsh-migrate', 'dsh-migrate-test.mjs', []],
+  ['protocols', 'protocols-test.mjs', []],
+  // The hand-written console that replaced the prebuilt React one: static
+  // surface, migration routes and the four-protocol wire probe.
+  ['console', 'console-test.mjs', []],
   ['standalone-channels', 'standalone-channels-test.mjs', []],
-  ['standalone-channel-filter', 'standalone-channel-filter-test.mjs', []],
-  ['standalone-model-operation', 'standalone-model-operation-test.mjs', []],
-  ['standalone-settings-host', 'standalone-settings-host-test.mjs', []],
   ['standalone-login-terminal', 'standalone-login-terminal-test.mjs', []],
-  ['standalone-package', 'standalone-package-test.mjs', ['--sources-only']],
   ['feedback-server', 'feedback-server-test.mjs', []],
   ['feedback-proxy', 'feedback-proxy-test.mjs', []],
   ['feedback-e2e', 'feedback-e2e-test.mjs', []],
@@ -125,7 +118,6 @@ const suites = [
   ['free-lane-quota', 'free-lane-quota-test.mjs', []],
   ['extensions', 'extensions-test.mjs', []],
   ['plugins', 'plugins-test.mjs', []],
-  ['plugins-ui', 'plugins-ui-test.mjs', []],
   ['sniff', 'sniff-test.mjs', []],
   ['stream-failure', 'stream-failure-test.mjs', []],
   ['truncation', 'truncation-test.mjs', []],
@@ -135,7 +127,6 @@ const suites = [
   ['speed-stat', 'speed-stat-test.mjs', []],
   ['picker', 'picker-test.mjs', []],
   ['tui', 'tui-test.mjs', []],
-  ['catalog', 'catalog-test.mjs', mode === 'contributor' ? ['--contributor'] : []],
   ['vault', 'vault-test.mjs', []],
   ['mint-eac-seal', 'mint-eac-seal-test.mjs', []],
   ['eac-auth', 'eac-auth-test.mjs', []],
@@ -165,8 +156,7 @@ const suites = [
   ['plugin-bench-ui', 'plugin-bench-ui-test.mjs', []],
   ['gateway-source', 'gateway-source-test.mjs', []],
   ['gateway-disconnect', 'gateway-disconnect-test.mjs', []],
-  ['standalone-nav', 'standalone-nav-test.mjs', []],
-].filter(([name]) => (mode === 'contributor' ? !['manifest', 'release'].includes(name)
+].filter(([name]) => (mode === 'contributor' ? !['legacy-payload'].includes(name)
   : mode === 'release' ? releaseSuites.has(name) : true)
   && (only === null || name.startsWith(only)))
 
@@ -179,7 +169,7 @@ if (only !== null && suites.length === 0) {
  * A suite that hangs must leave enough output to identify where it stopped.
  *
  * One of these bound a fixed port, lost the race to a suite running beside it, and
- * then sat in a `fetch` whose socket nobody answered — three minutes of the
+ * then sat in a `fetch` whose socket nobody answered 閳?three minutes of the
  * runner's own ceiling, after which it printed six `ok` lines as the "failure
  * detail" because buffered child output was unavailable. The deadline is well
  * above the slowest suite, and live output now identifies the last check seen.
@@ -230,7 +220,7 @@ function runSuite(script, args) {
 }
 
 const results = []
-console.log(`test mode: ${mode}${mode === 'contributor' ? ' — code checks only; release readiness is checked separately' : ''}`)
+console.log(`test mode: ${mode}${mode === 'contributor' ? ' 閳?code checks only; release readiness is checked separately' : ''}`)
 for (const [name, script, args] of suites) {
   const run = await runSuite(script, args)
   const output = `${run.stdout}${run.stderr}`.trimEnd().split('\n')
@@ -239,13 +229,13 @@ for (const [name, script, args] of suites) {
   results.push({ name, ok, ms: run.ms, output })
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${name.padEnd(14)} ${String(run.ms).padStart(5)} ms`)
   if (!ok) {
-    if (run.timedOut) console.log(`       killed at the ${SUITE_TIMEOUT_MS / 1000}s deadline — the live output above is the last diagnostic from the suite`)
+    if (run.timedOut) console.log(`       killed at the ${SUITE_TIMEOUT_MS / 1000}s deadline 閳?the live output above is the last diagnostic from the suite`)
     else if (hung) console.log(`       never finished (${run.error?.message ?? `signal ${run.signal}`})`)
-    const detail = output.filter(line => /^(FAIL|✗|Error|error:)/.test(line.trim())).slice(0, 6)
+    const detail = output.filter(line => /^(FAIL|閴佹⒍Error|error:)/.test(line.trim())).slice(0, 6)
     for (const line of (detail.length > 0 ? detail : output.slice(-12))) console.log(`       ${line}`)
   }
 }
 
 const failed = results.filter(result => !result.ok)
-console.log(`\n${results.length - failed.length}/${results.length} suites passed${failed.length > 0 ? ` — ${failed.map(f => f.name).join(', ')} failed` : ''}`)
+console.log(`\n${results.length - failed.length}/${results.length} suites passed${failed.length > 0 ? ` 閳?${failed.map(f => f.name).join(', ')} failed` : ''}`)
 process.exitCode = failed.length === 0 ? 0 : 1

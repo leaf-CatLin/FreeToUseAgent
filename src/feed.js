@@ -1,10 +1,13 @@
 /**
- * The remote announcement feed, plus the feedback form that reports against it.
+ * The announcement feed module — kept for its parser, its cache and its
+ * acknowledgement state.
  *
- * The repository owner publishes announcements by editing one JSON document in
- * the plugin's own GitHub repository — no server, no deploy step. Every running
- * installation re-reads it on boot, on a fixed poll, and on demand, so pushing
- * to `main` is the whole act of publishing.
+ * **This adaptation publishes no announcements.** Upstream polled a JSON document
+ * out of the project's GitHub repository on a timer, so every installed copy
+ * reached that repository whether or not the user wanted it, and the recovered
+ * items described releases that do not exist here. `DEFAULT_FEED_SOURCES` is
+ * empty; the fetch path below survives only so a self-hosted mirror can be opted
+ * into with the `feedUrl` setting, and it stays off otherwise.
  *
  * Sources are tried in order and the fetch is fail-open in both directions: a
  * network failure keeps serving the last cached copy, and a malformed feed is
@@ -15,45 +18,31 @@
  * and what has already raised a toast is state the caller owns, so that a feed
  * refresh never rewrites acknowledgement history.
  *
- * The feedback client lives here instead of in a module of its own because the
- * signed release set is pinned at the 80-file ceiling that older upgraders
- * enforce (`MAX_FILES` in the 1.3.1 / 2.5.9 readers): adding a shipped file
- * would make the release un-installable for every user still on those versions.
- * It has the same shape as the feed — one remote endpoint, fail-soft, validated
- * on the way in and out — so folding it in costs nothing but this paragraph.
- *
  * @module src/feed.js
  */
 
 import fs from 'node:fs'
 import path from 'node:path'
 
-const REPO = 'Ebony-Vinyl/dsh-our-free-model'
-
 /**
- * Feed locations, in preference order.
+ * Announcement sources.
  *
- * `raw.githubusercontent.com` is first because it is the repository's own bytes,
- * with no third-party cache in front of it. jsDelivr is the fallback for the
- * networks where raw is TLS-interfered (measured: the connection dies with an
- * unverifiable certificate) and the edge serves the same content there. The
- * repository's default branch is `main`; there is no `master` fallback because
- * GitHub answers that ref with HTTP 422. A minute-
- * resolution cache-buster is appended to jsDelivr URLs at fetch time so an
- * owner's push is never served stale from the CDN (its default cache holds up
- * to 12 hours).
+ * **This adaptation has no announcement channel.** The upstream project published
+ * announcements by editing a JSON document in its own GitHub repository, which
+ * meant every installed copy polled that repository on a timer — an outbound
+ * dependency this fork does not want and whose content describes releases that
+ * do not exist here.
+ *
+ * The list is empty, and {@link AnnouncementFeed} treats an empty source list as
+ * "nothing to fetch" rather than an error: the settings page renders an empty
+ * announcement list, which is the truthful state. The parser, sorter, expiry
+ * rules and acknowledgement store all remain, so the module keeps its public
+ * shape and its offline tests stay meaningful.
+ *
+ * A local mirror can still be pointed at with the `feedUrl` setting (loopback
+ * http or https); that path is unchanged and is what the test suites use.
  */
-export const DEFAULT_FEED_SOURCES = [
-  `https://raw.githubusercontent.com/${REPO}/main/feed/announcements.json`,
-  `https://cdn.jsdelivr.net/gh/${REPO}@main/feed/announcements.json`,
-  // A raw.githubusercontent.com proxy, for the networks where both origins above
-  // are slow or intermittently unreachable (see the note on the updater's
-  // DEFAULT_MANIFEST_SOURCES). The feed is a plain read with no signature of its
-  // own — the client sanitizes every item it renders — so this leg only has to
-  // return the same bytes; the cache-buster below keeps a proxy's edge from
-  // serving a stale copy.
-  `https://gh-proxy.com/https://raw.githubusercontent.com/${REPO}/main/feed/announcements.json`,
-]
+export const DEFAULT_FEED_SOURCES = []
 
 /** jsDelivr's edge caches per full URL; a minute-stamp keeps every poll fresh. */
 export function bustCdnCache(url, now = Date.now()) {
@@ -236,7 +225,10 @@ export class AnnouncementFeed {  /**
     const override = typeof this.deps.settings()?.feedUrl === 'string' ? this.deps.settings().feedUrl.trim() : ''
     const defaults = this.deps.defaultSources
     if (override === '') return defaults
-    const expanded = override.includes('{repo}') ? override.replace('{repo}', REPO) : override
+    // `{repo}` has no meaning in this adaptation: there is no upstream repository
+    // whose announcements a build could point at. The placeholder is dropped
+    // rather than expanded, so a stale setting cannot resurrect a remote source.
+    const expanded = override.replace('{repo}/', '')
     let parsed = null
     try { parsed = new URL(expanded) } catch { parsed = null }
     // URL.hostname keeps brackets on IPv6 (`[::1]`); everything loopback never
@@ -259,9 +251,18 @@ export class AnnouncementFeed {  /**
    */
   poll() {
     if (this.polling !== null) return this.polling
+    // No configured source means "this installation has no announcement
+    // channel", not a failure. Returning a clean empty result keeps `error` at
+    // '' so the settings page shows an empty list instead of a network fault.
+    const sources = this.sources()
+    if (sources.length === 0) {
+      this.cache = { at: 0, source: '', announcements: [] }
+      this.error = ''
+      return Promise.resolve({ arrived: [], total: 0, source: '' })
+    }
     this.polling = (async () => {
       try {
-        const { feed, source } = await fetchFeed(this.sources())
+        const { feed, source } = await fetchFeed(sources)
         const hadCache = !this.neverFetched
         const previousIds = new Set(this.knownIds)
         this.cache = { at: Date.now(), source, announcements: feed.announcements }

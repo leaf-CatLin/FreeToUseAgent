@@ -63,10 +63,19 @@ await checkAsync('package-manager hard links are treated as managed installation
     assert.equal(installationIsManaged(copied), false)
   } finally { fs.rmSync(directory, { recursive: true, force: true }) }
 })
-check('default update sources do not probe the removed master ref', () => {
-  assert.equal(DEFAULT_MANIFEST_SOURCES.some(source => source.includes('/master/')), false)
-  assert.ok(DEFAULT_MANIFEST_SOURCES.some(source => source.includes('/main/')))
+check('this adaptation ships no update channel and trusts no signing key', () => {
+  // The fork must never let a remote party replace its own code: an in-app
+  // upgrade would download upstream's files over every adaptation in it.
+  assert.deepEqual(DEFAULT_MANIFEST_SOURCES, [], 'no manifest source is shipped')
+  assert.equal(PINNED_MANIFEST_PUBLIC_KEY, '', 'no publisher key is pinned')
+  // With nothing pinned, any manifest a caller hands the verifier is refused.
+  assert.equal(verifyManifestSignature({ version: '9.9.9' }, PINNED_MANIFEST_PUBLIC_KEY), false)
 })
+
+// The rest of this suite exercises the manifest parser, the staging verifier and
+// the Ed25519 machinery against fixtures and a throwaway keypair: that code is
+// still shipped (it is what proves an untrusted manifest is refused), so it is
+// still tested here.
 
 // ── manifest validation ──────────────────────────────────────────────────────
 const manifestOf = overrides => ({

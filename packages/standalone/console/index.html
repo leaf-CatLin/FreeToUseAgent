@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Our Free Model — 本地推理服务</title>
+<link rel="stylesheet" href="/assets/console.css">
+<link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+</head>
+<body>
+<div id="app" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <img src="/assets/icon.svg" alt="" width="28" height="28">
+      <div>
+        <strong>Our Free Model</strong>
+        <span class="muted" id="product-line">本地推理服务</span>
+      </div>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="主导航">
+      <button role="tab" data-view="overview" aria-selected="true">概览</button>
+      <button role="tab" data-view="migrate">迁移凭据</button>
+      <button role="tab" data-view="lan">局域网与密钥</button>
+      <button role="tab" data-view="models">模型与试算</button>
+    </nav>
+    <div class="top-actions">
+      <span class="pill" id="health-pill" title="服务状态">连接中…</span>
+      <button class="ghost" id="signout" hidden>退出管理</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- ── 概览 ─────────────────────────────────────────────────────── -->
+    <section data-panel="overview" class="panel">
+      <div class="grid two">
+        <article class="card">
+          <h2>服务</h2>
+          <dl class="facts">
+            <dt>版本</dt><dd id="f-version">—</dd>
+            <dt>数据目录</dt><dd id="f-datadir" class="mono">—</dd>
+            <dt>本机 API</dt><dd id="f-api" class="mono">—</dd>
+            <dt>推理状态</dt><dd id="f-inference">—</dd>
+            <dt>模型总数</dt><dd id="f-models">—</dd>
+          </dl>
+        </article>
+        <article class="card">
+          <h2>局域网</h2>
+          <dl class="facts">
+            <dt>中继</dt><dd id="f-lan">—</dd>
+            <dt>地址</dt><dd id="f-lanurl" class="mono">—</dd>
+            <dt>LAN Key</dt><dd id="f-lankey" class="mono">—</dd>
+          </dl>
+          <p class="hint">管理台始终只监听本机回环；局域网只开放推理接口。</p>
+        </article>
+      </div>
+      <article class="card">
+        <h2>今日用量</h2>
+        <dl class="facts">
+          <dt>用户回合</dt><dd id="f-turns">—</dd>
+          <dt>输入 Token</dt><dd id="f-in">—</dd>
+          <dt>输出 Token</dt><dd id="f-out">—</dd>
+          <dt>失败回合</dt><dd id="f-failed">—</dd>
+        </dl>
+      </article>
+    </section>
+
+    <!-- ── 迁移凭据 ─────────────────────────────────────────────────── -->
+    <section data-panel="migrate" class="panel" hidden>
+      <article class="card">
+        <h2>从 dsh 导入已有登录凭据</h2>
+        <p class="hint">
+          读取 dsh 数据目录里的 <code>.credentials.yaml</code> 与 <code>channel-pack/</code>，
+          把十个免费账号渠道写入本服务自己的凭据库。无法读取 dsh 时可改为上传备份文件。
+        </p>
+        <div class="field">
+          <label for="dsh-home">dsh 数据目录</label>
+          <input id="dsh-home" class="mono" placeholder="留空则依次尝试 DSH_HOME、~/.dsh">
+        </div>
+        <div class="row">
+          <label class="check"><input type="checkbox" id="dry-run" checked> 演练（只报告计数，不写文件）</label>
+          <label class="check"><input type="checkbox" id="replace"> 整体覆盖既有凭据与账号池</label>
+          <label class="check"><input type="checkbox" id="with-ledger"> 附带积分账本与签到</label>
+        </div>
+        <div class="row">
+          <button class="primary" id="btn-import-dsh">开始导入</button>
+          <button class="ghost" id="btn-preview-dsh">查看将写入的计数</button>
+        </div>
+        <pre class="output" id="migrate-out" hidden></pre>
+      </article>
+
+      <article class="card">
+        <h2>备份文件</h2>
+        <div class="row">
+          <button class="ghost" id="btn-export-backup">导出当前账号池</button>
+          <label class="ghost file-btn">
+            选择备份文件并导入
+            <input type="file" id="file-import" accept="application/json,.json" hidden>
+          </label>
+        </div>
+        <p class="hint">备份是明文 JSON，含可用的 refresh token，请妥善保存。</p>
+        <pre class="output" id="backup-out" hidden></pre>
+      </article>
+    </section>
+
+    <!-- ── 局域网与密钥 ─────────────────────────────────────────────── -->
+    <section data-panel="lan" class="panel" hidden>
+      <article class="card">
+        <h2>局域网推理中继</h2>
+        <div class="row">
+          <label class="check"><input type="checkbox" id="lan-enabled"> 启用 LAN 中继</label>
+          <div class="field narrow">
+            <label for="lan-port">期望端口</label>
+            <input id="lan-port" type="number" min="0" max="65535" value="0">
+          </div>
+          <button class="primary" id="btn-save-lan">保存</button>
+        </div>
+        <dl class="facts">
+          <dt>运行状态</dt><dd id="l-state">—</dd>
+          <dt>实际端口</dt><dd id="l-port">—</dd>
+          <dt>可用地址</dt><dd id="l-urls" class="mono">—</dd>
+        </dl>
+        <p class="hint">端口填 0 表示每次启动自动分配。中继只转发模型清单与推理接口。</p>
+      </article>
+
+      <article class="card">
+        <h2>密钥</h2>
+        <dl class="facts">
+          <dt>本机 API Key</dt>
+          <dd class="keyline">
+            <code id="k-local" class="mono secret" data-secret>••••••••••••</code>
+            <button class="ghost small" data-reveal="k-local">显示</button>
+            <button class="ghost small" data-copy="k-local">复制</button>
+          </dd>
+          <dt>LAN Key</dt>
+          <dd class="keyline">
+            <code id="k-lan" class="mono secret" data-secret>••••••••••••</code>
+            <button class="ghost small" data-reveal="k-lan">显示</button>
+            <button class="ghost small" data-copy="k-lan">复制</button>
+          </dd>
+        </dl>
+        <div class="row">
+          <button class="danger" id="btn-rotate-lan">轮换 LAN Key</button>
+          <button class="danger" id="btn-rotate-local">轮换本机 API Key</button>
+        </div>
+        <p class="hint">
+          轮换本机 Key 会让所有本地客户端失效；轮换 LAN Key 只影响局域网客户端。
+          本机 Key 轮换后当前管理会话保留。
+        </p>
+      </article>
+
+      <article class="card">
+        <h2>接入信息</h2>
+        <div class="snippet-row">
+          <span class="label">OpenAI 兼容</span>
+          <code class="mono" id="s-openai">—</code>
+        </div>
+        <div class="snippet-row">
+          <span class="label">curl 示例</span>
+          <pre class="snippet" id="s-curl"></pre>
+        </div>
+      </article>
+    </section>
+
+    <!-- ── 模型与试算 ───────────────────────────────────────────────── -->
+    <section data-panel="models" class="panel" hidden>
+      <article class="card">
+        <div class="card-head">
+          <h2>模型清单 <span class="muted" id="m-count"></span></h2>
+          <div class="row tight">
+            <input id="m-search" type="search" placeholder="按名称或 ID 过滤" aria-label="过滤模型">
+            <button class="ghost" id="btn-refresh">刷新清单</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="models">
+            <thead>
+              <tr><th>模型 ID</th><th>渠道</th><th>上下文</th><th>最大输出</th><th>能力</th><th></th></tr>
+            </thead>
+            <tbody id="m-rows"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+          </table>
+        </div>
+        <p class="hint" id="m-hint">渠道模型由上游实时拉取，离线时只显示缓存与匿名车道。</p>
+      </article>
+
+      <article class="card">
+        <h2>在线试算</h2>
+        <div class="field">
+          <label for="t-model">模型</label>
+          <select id="t-model"></select>
+        </div>
+        <div class="field">
+          <label for="t-prompt">提问</label>
+          <textarea id="t-prompt" rows="4" placeholder="回复一句话证明链路通了">回复一句话证明链路通了</textarea>
+        </div>
+        <div class="row">
+          <div class="field narrow">
+            <label for="t-proto">协议</label>
+            <select id="t-proto">
+              <option value="openai">OpenAI Chat</option>
+              <option value="anthropic">Anthropic Messages</option>
+              <option value="gemini">Gemini generateContent</option>
+              <option value="ollama">Ollama /api/chat</option>
+            </select>
+          </div>
+          <div class="field narrow">
+            <label for="t-max">最大输出</label>
+            <input id="t-max" type="number" min="16" max="4096" value="128">
+          </div>
+          <button class="primary" id="btn-test">发送</button>
+          <button class="ghost" id="btn-test-cancel" hidden>取消</button>
+        </div>
+        <pre class="output" id="t-out" hidden></pre>
+      </article>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span class="muted">管理台仅限本机访问 · <span id="foot-version">—</span></span>
+  </footer>
+</div>
+
+<!-- 登录卡片：一次性链接兑换失败或会话过期时显示 -->
+<div id="login" class="login" hidden>
+  <form class="card login-card" id="login-form">
+    <img src="/assets/icon.svg" alt="" width="40" height="40">
+    <h1>登录管理台</h1>
+    <p class="hint" id="login-hint">
+      用启动时打印的一次性链接可以完成全部操作。手动登录时请使用
+      <code>settings.json</code> 里的 <code>managementKey</code>；
+      用本机 API Key（<code>forwardKey</code>）也能进入，但读取与迁移凭据的操作会被拒绝。
+    </p>
+    <div class="field">
+      <label for="login-key">管理密钥</label>
+      <input id="login-key" type="password" autocomplete="off" spellcheck="false" required>
+    </div>
+    <button class="primary" type="submit" id="login-submit">登录</button>
+    <p class="error" id="login-error" hidden></p>
+  </form>
+</div>
+
+<script type="module" src="/assets/console.js"></script>
+</body>
+</html>

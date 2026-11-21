@@ -41,6 +41,7 @@ import { toMessagesResponse, tryOptimizations } from './local-optimize.js'
 import { carryFailure, forwardFailure } from './failure.js'
 import { deferStreamResponse } from './deferred-response.js'
 import { geminiEndpoint, geminiError, geminiRoute } from './gemini.js'
+import { fromOllamaRequest, ollamaError, ollamaResponse, ollamaTags, createOllamaFrames, OLLAMA_ROUTES } from './protocols/ollama.js'
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024
 const REQUEST_ID_HEADER = 'x-ofm-request-id'
@@ -399,6 +400,13 @@ export async function startForwardServer({ config, complete, modelRows, log = ()
       json(res, 200, countTokens(body))
       return
     }
+    // Ollama's native surface. It authenticates like every other route above:
+    // `/api/tags` and `/api/chat` are inference-facing, so they sit behind the
+    // same key rather than being reachable anonymously.
+    if (OLLAMA_ROUTES.has(path)) {
+      await serveCompletion(req, res, complete, ollamaEndpoint, heartbeatMs, trace, { modelRows })
+      return
+    }
     openAiError(res, 404, 'not_found_error', `no route for ${req.method} ${path}`)
   }
 
@@ -482,17 +490,56 @@ export function rankLanAddresses(interfaces) {
   return rows.map(row => row.address)
 }
 
-/** The routes the LAN relay carries — the local listener's surface and nothing else. */
+/** The fixed routes the LAN relay carries — the local listener's surface and nothing else. */
 const RELAY_PATHS = new Set([
   '/v1/models', '/models',
   '/v1/chat/completions', '/chat/completions',
   '/v1/responses', '/responses',
   '/v1/messages', '/messages',
   '/v1/messages/count_tokens', '/messages/count_tokens',
+  // Ollama's native surface. Without these entries the relay could reach the
+  // OpenAI/Anthropic wires but not the two clients that only speak `/api/*`.
+  '/api/tags', '/api/chat', '/api/generate',
+  // Gemini model discovery. A client that lists models before it generates —
+  // every Google SDK does — would otherwise fail at its first call.
+  '/v1beta/models',
 ])
+
+/**
+ * The Gemini v1beta surface carries the model and the method in the path, so it
+ * cannot be a fixed entry. The pattern is anchored and deliberately narrow: one
+ * model segment (no `/`, no `.`), one of the three published methods, nothing
+ * else. Percent-encoding is not decoded before the match, so an encoded `..` or
+ * `%2f` fails the class and is refused rather than normalized into a path the
+ * listener would route.
+ */
+const RELAY_GEMINI_RE = /^\/v1beta\/models\/[A-Za-z0-9][A-Za-z0-9._-]{0,199}:(?:generateContent|streamGenerateContent|countTokens)$/
+
+/** Is this path one the relay is allowed to dial on the local listener? */
+function relayCarries(path) {
+  return RELAY_PATHS.has(path) || RELAY_GEMINI_RE.test(path)
+}
 
 /** Marks a request the relay produced, so a misconfigured loop is refused. */
 const RELAY_HOP_HEADER = 'x-ofm-relay-hop'
+
+/**
+ * The query string minus any Gemini `key` parameter.
+ *
+ * A Gemini client may present its credential as `?key=…`; the relay authenticates
+ * that value itself, so forwarding it would put the LAN credential on the local
+ * listener's URL (and therefore in its request line). Every other parameter
+ * survives untouched, so `alt=sse` and pagination still reach the endpoint.
+ */
+function searchWithoutKey(params) {
+  const kept = new URLSearchParams()
+  for (const [name, value] of params) {
+    if (name === 'key' || name === 'x-goog-api-key') continue
+    kept.append(name, value)
+  }
+  const text = kept.toString()
+  return text === '' ? '' : `?${text}`
+}
 
 /**
  * Start the optional LAN relay.
@@ -564,7 +611,7 @@ export async function startLanRelay({ config, log = () => {}, onTrace = () => {}
       openAiError(res, 503, 'service_unavailable', 'the local forward listener is not running')
       return
     }
-    if (!RELAY_PATHS.has(path)) {
+    if (!relayCarries(path)) {
       openAiError(res, 404, 'not_found_error', `no route for ${req.method} ${path}`)
       return
     }
@@ -572,6 +619,7 @@ export async function startLanRelay({ config, log = () => {}, onTrace = () => {}
     delete headers.host
     delete headers.connection
     delete headers['x-api-key']
+    delete headers['x-goog-api-key']
     // The caller's LAN key stops at this door; the local listener only ever sees
     // the key that belongs to this machine.
     headers.authorization = `Bearer ${settings.localKey}`
@@ -583,7 +631,9 @@ export async function startLanRelay({ config, log = () => {}, onTrace = () => {}
       host: '127.0.0.1',
       port: settings.targetPort,
       method: req.method,
-      path: `${path}${url.search}`,
+      // Gemini callers may carry their key in `?key=`; that spelling is stripped
+      // so the LAN credential never reaches the local listener or its logs.
+      path: `${path}${searchWithoutKey(url.searchParams)}`,
       headers,
     })
     target.once('socket', socket => {
@@ -1383,6 +1433,108 @@ async function responsesEndpoint(req, res, complete, options = {}) {
       total_tokens: outcome.usage?.total_tokens ?? 0,
     },
   })
+}
+
+/**
+ * The Ollama native surface (`/api/*`).
+ *
+ * Ollama's own clients (its CLI, Open WebUI, LangChain's `ChatOllama`, Continue)
+ * speak NDJSON, not SSE, and put tool arguments in a JSON object rather than a
+ * string. Rather than force them through an OpenAI shim, the request is decoded
+ * into the same harness request the other surfaces build, so tool pairing,
+ * images and the token savers all apply, and the answer is rendered as NDJSON
+ * from the harness chunk stream.
+ *
+ * Every route is rendered from `src/protocols/ollama.js`, which does no I/O: the
+ * frames are asserted without a socket in `scripts/protocols-test.mjs`.
+ */
+async function ollamaEndpoint(req, res, complete, options = {}) {
+  const url = new URL(req.url ?? '/', 'http://localhost')
+  const path = url.pathname.replace(/\/+$/, '') || '/'
+  if (!OLLAMA_ROUTES.has(path)) {
+    ollamaError(res, 404, `no route for ${req.method} ${path}`)
+    return
+  }
+  if (path === '/api/tags') {
+    if (req.method !== 'GET') { ollamaError(res, 405, 'model discovery requires GET'); return }
+    json(res, 200, ollamaTags(options.modelRows()))
+    return
+  }
+  if (req.method !== 'POST') { ollamaError(res, 405, `${path} requires POST`); return }
+  const route = path === '/api/chat' ? 'chat' : 'generate'
+  let request
+  try {
+    const body = await readBody(req)
+    options.trace?.step('body_received')
+    request = fromOllamaRequest(body, route)
+  } catch (error) {
+    ollamaError(res, error.statusCode ?? 400, error.message ?? 'invalid request')
+    return
+  }
+  const model = request.model
+  const stream = request.stream === true
+  const wire = { model, openAi: undefined, messages: request.messages }
+  if (request.tools !== undefined) wire.tools = request.tools
+  if (request.maxTokens !== undefined) wire.maxTokens = request.maxTokens
+  if (request.temperature !== undefined) wire.temperature = request.temperature
+  if (request.top_p !== undefined) wire.topP = request.top_p
+  if (request.top_k !== undefined) wire.topK = request.top_k
+  if (request.seed !== undefined) wire.seed = request.seed
+  if (request.stop !== undefined) wire.stop = request.stop
+  if (request.reasoningEffort !== undefined) wire.reasoningEffort = request.reasoningEffort
+  if (request.responseFormat !== undefined) wire.responseFormat = request.responseFormat
+
+  if (!stream) {
+    const outcome = await complete(wire)
+    if (outcome.error !== undefined) {
+      const failure = forwardFailure(outcome)
+      ollamaError(res, failure.status, failure.error.message)
+      return
+    }
+    json(res, 200, ollamaResponse(model, outcome, { usage: outcome.usage, finish: outcome.finish ?? (outcome.truncated ? { kind: 'max-tokens' } : { kind: 'stop' }) }))
+    return
+  }
+
+  res.writeHead(200, {
+    ...corsHeaders(),
+    'content-type': 'application/x-ndjson; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    'x-accel-buffering': 'no',
+  })
+  startHeartbeat(res, options.heartbeatMs)
+  const frames = createOllamaFrames(model)
+  let usage
+  let finish
+  const write = line => { if (line !== undefined && !res.destroyed && !res.writableEnded) res.write(`${line}\n`) }
+  try {
+    const outcome = await complete(wire, chunk => {
+      if (res.destroyed) return
+      if (chunk.type === 'usage') usage = chunk.usage
+      if (chunk.type === 'finish') finish = chunk.reason ?? { kind: 'stop' }
+      if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') write(frames.render(chunk))
+      // Tool identity is announced as soon as the call names itself; the
+      // arguments are only forwarded once the call is complete, because Ollama
+      // carries them as one object rather than as streamed fragments.
+      if (chunk.type === 'block-end' && chunk.block?.type === 'tool-call') {
+        write(frames.render({ type: 'tool-call', id: chunk.block.id, name: chunk.block.name, arguments: chunk.block.arguments }))
+      }
+    })
+    if (outcome.error !== undefined && !res.writableEnded) {
+      // Headers and frames are already out; the terminal line must say so
+      // instead of ending a 200 as if the turn had completed.
+      write(JSON.stringify({ model, error: String(outcome.error) }))
+      res.end()
+      return
+    }
+    write(frames.finish({ usage: outcome.usage ?? usage, finish: outcome.finish ?? finish }))
+    res.end()
+  } catch (error) {
+    if (!res.writableEnded) {
+      write(JSON.stringify({ model, error: String(error?.message ?? error).slice(0, 1024) }))
+      res.end()
+    }
+  }
 }
 
 /**

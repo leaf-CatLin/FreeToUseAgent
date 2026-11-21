@@ -1,3 +1,16 @@
+/**
+ * 桌面更新通道在本改编版中被关闭。
+ *
+ * 上游的 `desktop-update.mjs` 会从项目自己的 GitHub releases 下载桌面安装包并
+ * 生成原生安装凭据。那意味着一次「检查更新」就能把本地代码换成上游版本，
+ * 本次改编的独立服务、凭据迁移与多协议改动会被整体覆盖。
+ *
+ * 因此 `REPO` 为空：`supported` 恒为 false，`check()` 与 `download()` 都以
+ * 明确的 503 拒绝，`selectDesktopRelease` / `installerChecksum` 这些纯函数仍然
+ * 保留（它们本身不联网，也是「外部安装包地址一律拒绝」这条规则的证明）。
+ *
+ * 本套件验证的是这条不变量本身，以及管理接口在被拒绝时的形状。
+ */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -6,93 +19,93 @@ import crypto from 'node:crypto'
 import { createDesktopUpdater, selectDesktopRelease, newerVersion, installerChecksum } from '../packages/standalone/desktop-update.mjs'
 
 // `realpath` because macOS hands out a temp dir under `/var`, which is a symlink
-// to `/private/var` — the managed-storage checks reject any symlinked ancestor,
-// so an unresolved path fails on macOS before a single assertion runs.
+// to `/private/var`.
 const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ofm-desktop-update-')))
 const bytes = Buffer.from('官方安装包下载夹具，不执行安装')
 const sha = crypto.createHash('sha256').update(bytes).digest('hex')
-const release = version => ({ tag_name: `v${version}`, draft: false, prerelease: false, body: '更新说明', assets: [
-  { name: `Our.Free.Model_${version}_x64-setup.exe`, size: bytes.length, browser_download_url: `https://github.com/Ebony-Vinyl/dsh-our-free-model/releases/download/v${version}/Our.Free.Model_${version}_x64-setup.exe` },
-  { name: 'SHA256SUMS', browser_download_url: `https://github.com/Ebony-Vinyl/dsh-our-free-model/releases/download/v${version}/SHA256SUMS` },
-] })
-let mode = 'ok', requests = 0
-const fixtureFetch = async (url) => {
-  requests++
-  if (mode === 'redirect') return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/private' } })
-  if (mode === 'network') throw new TypeError('fetch failed')
-  if (url.startsWith('https://api.github.com/')) return new Response(JSON.stringify([
-    { tag_name: 'v2.7.9', assets: [{ name: 'dsh-our-free-model-2.7.9.tgz' }] },
-    { ...release('9.0.0'), prerelease: true }, release('2.7.3'), release('2.7.1'),
-  ]))
-  if (url.endsWith('/SHA256SUMS')) return new Response(`${mode === 'bad-hash' ? '0'.repeat(64) : sha}  Our.Free.Model_2.7.3_x64-setup.exe\n`)
-  return new Response(mode === 'oversize' ? Buffer.concat([bytes, Buffer.from('多余')]) : bytes,
-    { headers: mode === 'wrong-size-header' ? { 'content-length': '99999' } : {} })
+
+/** 一个记录所有出站请求的替身：任何下载尝试都会留下痕迹。 */
+let requests = 0
+const fixtureFetch = async () => {
+  requests += 1
+  return new Response('should never be reached', { status: 500 })
 }
+
 let checks = 0
-const check = async (name, run) => { await run(); console.log(`ok ${++checks} - ${name}`) }
-const manager = (name, extra = {}) => createDesktopUpdater({ dataDir: path.join(scratch, name), version: '2.7.1', platform: 'win32', arch: 'x64', fetchImpl: fixtureFetch, ...extra })
-const runCheck = async updater => { updater.check(); const state = await updater.settled(); assert.equal(state.phase, 'idle'); return state }
+const check = async (name, run) => {
+  await run()
+  console.log(`ok ${++checks} - ${name}`)
+}
+
+const release = version => ({
+  tag_name: `v${version}`, draft: false, prerelease: false, body: '更新说明',
+  assets: [
+    { name: `Our.Free.Model_${version}_x64-setup.exe`, size: bytes.length,
+      browser_download_url: `https://github.com/some-owner/some-repo/releases/download/v${version}/Our.Free.Model_${version}_x64-setup.exe` },
+    { name: 'SHA256SUMS',
+      browser_download_url: `https://github.com/some-owner/some-repo/releases/download/v${version}/SHA256SUMS` },
+  ],
+})
+
+const manager = (name, extra = {}) => createDesktopUpdater({
+  dataDir: path.join(scratch, name), version: '2.7.1', platform: 'win32', arch: 'x64',
+  fetchImpl: fixtureFetch, ...extra,
+})
+
 try {
-  await check('跳过仅插件、预发布与旧版本，按真实桌面包选择最高版本', async () => {
-    const updater = manager('versions'); const state = await runCheck(updater)
-    assert.equal(state.latest.version, '2.7.3'); assert.equal(state.available, true)
+  await check('本改编版不支持任何桌面更新：supported 恒为 false', () => {
+    const updater = manager('status')
+    const status = updater.status()
+    assert.equal(status.supported, false)
+    assert.equal(status.available, false)
+    assert.equal(status.latest, null)
+  })
+
+  await check('检查更新被拒绝，且不发出任何网络请求', () => {
+    const updater = manager('check')
+    const before = requests
+    assert.throws(() => updater.check(), error => error.statusCode === 503)
+    assert.equal(requests, before, 'a disabled channel must not reach the network')
+  })
+
+  await check('下载被拒绝，既不产生安装凭据也不写临时文件', async () => {
+    const updater = manager('download')
+    assert.throws(() => updater.download(), error => error.statusCode === 503)
+    const directory = path.join(scratch, 'download', 'desktop-updates')
+    assert.equal(fs.existsSync(path.join(directory, 'ready.json')), false)
+    assert.equal(fs.existsSync(directory), false)
+  })
+
+  await check('关闭后的管理器仍然只报「不支持」，不泄露内部状态', () => {
+    const updater = manager('closed')
+    updater.close()
+    // Both "this build has no channel" and "the manager is closed" answer 503;
+    // the build's own refusal wins because it is checked first.
+    assert.throws(() => updater.check(), error => error.statusCode === 503)
+  })
+
+  await check('纯函数保留：版本比较与外部安装包地址仍然被拒绝', () => {
     assert.equal(newerVersion('2.10.0', '2.9.9'), true)
     assert.equal(newerVersion('2.7.1', '2.7.1'), false)
-    assert.equal(selectDesktopRelease([{ tag_name: 'v3.0.0', assets: [{ name: 'plugin.tgz' }] }]), null)
+    // With no release repository configured, *every* asset URL is "not this
+    // project", so no release can ever be selected — not even a well-formed one.
+    assert.throws(() => selectDesktopRelease([release('2.7.3')]), /不属于本项目/)
+    // A differently-named asset never reaches the URL check; it is filtered by the
+    // installer name first, so the answer is simply "nothing selectable".
     assert.equal(selectDesktopRelease([release('2.7.3')], 'arm64'), null)
-  })
-  await check('SHA 校验成功后才生成原生安装凭据，并保留配置', async () => {
-    const updater = manager('download'); await runCheck(updater)
-    fs.mkdirSync(path.join(scratch, 'download'), { recursive: true }); fs.writeFileSync(path.join(scratch, 'download/settings.json'), '原有配置')
-    assert.equal(updater.download().phase, 'downloading'); assert.equal((await updater.settled()).phase, 'ready')
-    const directory = path.join(scratch, 'download/desktop-updates')
-    assert.deepEqual(fs.readFileSync(path.join(directory, `installer-${sha}.exe`)), bytes)
-    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(directory, 'ready.json'))), { schemaVersion: 1, version: '2.7.3', size: bytes.length, sha256: sha })
-    assert.equal(fs.readFileSync(path.join(scratch, 'download/settings.json'), 'utf8'), '原有配置')
-    const previous = requests; updater.download(); await updater.settled(); assert.equal(requests - previous, 1, '有效缓存只重读官方校验文件')
-  })
-  await check('坏摘要、超限下载及错误长度不会写入安装凭据，临时文件被清理', async () => {
-    for (const failure of ['bad-hash', 'oversize', 'wrong-size-header']) {
-      mode = 'ok'; const updater = manager(failure); await runCheck(updater)
-      mode = failure; updater.download(); const state = await updater.settled()
-      assert.equal(state.phase, 'error'); assert(state.error)
-      const dir = path.join(scratch, failure, 'desktop-updates')
-      assert.equal(fs.existsSync(path.join(dir, 'ready.json')), false)
-      assert.equal(fs.readdirSync(dir).some(name => /\.(part|tmp)$/.test(name)), false)
-    }
-    mode = 'ok'
-  })
-  await check('下载缓存篡改后重新下载，检查新版本时旧安装凭据失效', async () => {
-    const updater = manager('corrupt'); await runCheck(updater); updater.download(); await updater.settled()
-    const dir = path.join(scratch, 'corrupt/desktop-updates'); fs.writeFileSync(path.join(dir, `installer-${sha}.exe`), '坏缓存')
-    updater.download(); assert.equal((await updater.settled()).phase, 'ready'); assert.deepEqual(fs.readFileSync(path.join(dir, `installer-${sha}.exe`)), bytes)
-    await runCheck(updater); assert.equal(fs.existsSync(path.join(dir, 'ready.json')), false)
-  })
-  await check('拒绝重复操作、未检查的下载及已关闭管理器', async () => {
-    const updater = manager('concurrent'); assert.throws(() => updater.download(), /先检查/)
-    updater.check(); assert.throws(() => updater.check(), error => error.statusCode === 409)
-    await updater.settled(); updater.close(); assert.throws(() => updater.check(), /关闭/)
-  })
-  await check('拒绝外部安装包地址、非 HTTPS 重定向和不唯一的摘要', async () => {
-    const foreign = release('2.7.3'); foreign.assets[0].browser_download_url = 'https://evil.invalid/setup.exe'
+    assert.equal(selectDesktopRelease([{ tag_name: 'v3.0.0', assets: [{ name: 'plugin.tgz' }] }]), null)
+    const foreign = release('2.7.3')
+    foreign.assets[0].browser_download_url = 'https://evil.invalid/setup.exe'
     assert.throws(() => selectDesktopRelease([foreign]), /官方发布源/)
     assert.throws(() => installerChecksum(`${sha}  setup.exe\n${sha}  setup.exe`, 'setup.exe'), /唯一/)
-    mode = 'redirect'; const updater = manager('redirect'); updater.check(); assert.equal((await updater.settled()).phase, 'error'); mode = 'ok'
+    assert.equal(installerChecksum(`${sha}  setup.exe\n`, 'setup.exe'), sha)
   })
-  await check('不支持的平台与浏览器服务不发更新请求，当前版本无需降级', async () => {
-    const unsupported = manager('unsupported', { platform: 'darwin' }); const previous = requests
-    assert.throws(() => unsupported.check(), /Windows/); assert.equal(requests, previous)
-    const browser = manager('browser', { version: undefined }); assert.equal(browser.status().supported, false)
-    const latest = manager('latest', { version: '2.8.0' }); assert.equal((await runCheck(latest)).available, false); assert.throws(() => latest.download(), /先检查/)
-  })
-  await check('网络失败显示错误且允许重新检查恢复', async () => {
-    const updater = manager('recovery'); mode = 'network'; updater.check(); assert.equal((await updater.settled()).phase, 'error')
-    mode = 'ok'; assert.equal((await runCheck(updater)).available, true)
-  })
-  await check('实际管理接口要求私有会话与同源，且不提供 HTTP 安装入口', async () => {
+
+  await check('管理接口：需要私有会话与同源，且检查更新同样被拒绝', async () => {
     const savedFetch = globalThis.fetch
     const previousVersion = process.env.OFM_DESKTOP_VERSION
     process.env.OFM_DESKTOP_VERSION = '2.7.1'
+    // 只替换非回环流量：任何往上游取的请求都会把计数打上去，从而被断言发现。
     globalThis.fetch = (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input))
       return ['127.0.0.1', 'localhost'].includes(url.hostname) ? savedFetch(input, init) : fixtureFetch(url.href, init)
@@ -100,30 +113,36 @@ try {
     let service
     try {
       const { startStandalone } = await import('../packages/standalone/service.mjs')
-      // The endpoint refuses to check anywhere but Windows x64, and CI is not
-      // that host. Declare the host instead of skipping the flow: the point of
-      // this case is the HTTP wiring, which must be exercised where CI runs.
-      service = await startStandalone({ dataDir: path.join(scratch, 'http'), port: 0, refresh: false, logger: { warn() {} }, desktopPlatform: 'win32', desktopArch: 'x64' })
+      service = await startStandalone({
+        dataDir: path.join(scratch, 'http'), port: 0, refresh: false, logger: { warn() {} },
+        desktopPlatform: 'win32', desktopArch: 'x64',
+      })
       const api = '/api/management/desktop-update'
-      const request = (route, options = {}) => savedFetch(service.url + route, { ...options, headers: { origin: service.url, 'content-type': 'application/json', ...options.headers } })
-      assert.equal((await request(api)).status, 401)
+      const request = (route, options = {}) => savedFetch(service.url + route, {
+        ...options,
+        headers: { origin: service.url, 'content-type': 'application/json', ...options.headers },
+      })
+
+      assert.equal((await request(api)).status, 401, '未鉴权时拒绝')
       const key = JSON.parse(fs.readFileSync(service.keyFile)).forwardKey
-      assert.equal((await request(api, { headers: { authorization: `Bearer ${key}` } })).status, 403)
+      assert.equal((await request(api, { headers: { authorization: `Bearer ${key}` } })).status, 403, '本机 Key 不足以进入管理面')
+
       const token = new URLSearchParams(new URL(service.managementUrl).hash.slice(1)).get('login')
       const login = await request('/api/management/session', { method: 'POST', body: JSON.stringify({ bootstrapToken: token }) })
       assert.equal(login.status, 200)
       const cookie = login.headers.get('set-cookie').split(';')[0]
-      assert.equal((await request(api, { headers: { cookie } })).status, 200)
-      assert.equal((await request(api + '/check', { method: 'POST', body: '{}', headers: { cookie, origin: 'https://foreign.invalid' } })).status, 403)
-      assert.equal((await request(api + '/install', { method: 'POST', body: '{}', headers: { cookie } })).status, 404)
-      assert.equal((await request(api + '/check', { method: 'POST', body: '{}', headers: { cookie } })).status, 200)
-      let status
-      for (let i = 0; i < 100; i++) {
-        status = await (await request(api, { headers: { cookie } })).json()
-        if (status.phase !== 'checking') break
-        await new Promise(resolve => setTimeout(resolve, 10))
-      }
-      assert.equal(status.latest.version, '2.7.3')
+
+      const status = await (await request(api, { headers: { cookie } })).json()
+      assert.equal(status.supported, false, '状态里明确写出不支持')
+      assert.equal(status.available, false)
+
+      assert.equal((await request(`${api}/check`, { method: 'POST', body: '{}', headers: { cookie, origin: 'https://foreign.invalid' } })).status, 403, '跨站被拒')
+      assert.equal((await request(`${api}/install`, { method: 'POST', body: '{}', headers: { cookie } })).status, 404, '没有 HTTP 安装入口')
+
+      const before = requests
+      assert.equal((await request(`${api}/check`, { method: 'POST', body: '{}', headers: { cookie } })).status, 503, '检查更新被拒绝')
+      assert.equal((await request(`${api}/download`, { method: 'POST', body: '{}', headers: { cookie } })).status, 503, '下载被拒绝')
+      assert.equal(requests, before, '两条路径都没有触达网络')
     } finally {
       await service?.close()
       globalThis.fetch = savedFetch
@@ -131,7 +150,8 @@ try {
       else process.env.OFM_DESKTOP_VERSION = previousVersion
     }
   })
-  console.log(`${checks}/${checks} 桌面更新检查通过；所有下载均为本地替身，未执行安装器`)
+
+  console.log(`${checks}/${checks} 桌面更新通道关闭检查通过；全程未发出任何外网请求`)
 } finally {
   assert.equal(path.dirname(scratch), fs.realpathSync(os.tmpdir()))
   fs.rmSync(scratch, { recursive: true, force: true })

@@ -163,30 +163,15 @@ check('translated totals count only projects with real star readings', () => {
   picksFixture = undefined
 })
 
-// The announcement is the only thing that tells users the page exists, and it is
-// published by a separate push — so it has to name the same repositories the
-// page renders, and its HTML has to survive the client's allowlist parser with
-// both links intact. A typo in one URL here is a broken promise, not a style nit.
-check('the shipped announcement links every project through the sanitizer', () => {
-  const feed = JSON.parse(fs.readFileSync(new URL('../feed/announcements.json', import.meta.url), 'utf8'))
-  const item = feed.announcements.find(row => row.id === '2026-10-16-picks-page')
-  assert.ok(item !== undefined, 'the picks announcement is in the feed')
-  // The parser's virtual tree, not a rendered one: `{type:'el'}` nodes whose text
-  // children are plain strings.
-  const hrefs = []
-  const words = []
-  const walk = node => {
-    if (typeof node === 'string') { words.push(node); return }
-    if (node === null || typeof node !== 'object') return
-    if (node.props?.href !== undefined) hrefs.push(node.props.href)
-    for (const child of node.children ?? []) walk(child)
-  }
-  for (const node of parseSafeHtml(item.html)) walk(node)
-  for (const repo of ['https://github.com/Ebony-Vinyl/EAC-Desktop', 'https://github.com/Ebony-Vinyl/EAC-Pack', 'https://github.com/Ebony-Vinyl/EAC-design-world']) {
-    assert.equal(hrefs.includes(repo), true, `${repo} is linked`)
-  }
-  const body = words.join(' ')
-  for (const name of ['EAC-Desktop', 'EAC-Pack', 'EAC-design-world']) assert.equal(body.includes(name), true, `${name} is named`)
+// This adaptation publishes no announcements, so there is no shipped JSON to
+// validate. What must stay true is that the absence is *total*: no announcement
+// document is shipped, and the default source list is empty, so nothing can
+// re-introduce a remote-channel dependency through this path.
+check('no announcement document is shipped and no remote source replaces it', () => {
+  assert.equal(fs.existsSync(new URL('../feed/announcements.json', import.meta.url)), false,
+    'feed/announcements.json must not be shipped by this adaptation')
+  assert.equal(fs.existsSync(new URL('../feed', import.meta.url)), false,
+    'the feed directory must not be shipped by this adaptation')
 })
 
 console.log(failures === 0 ? '\npicks-ui: three cards, three working asks' : `\n${failures} check(s) failed`)

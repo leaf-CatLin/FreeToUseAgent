@@ -30,6 +30,16 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { restrictPermissions } from './open-external.js'
 
+/**
+ * The repository the snapshot resolver knows how to pin.
+ *
+ * This adaptation ships no manifest source and pins no public key, so the
+ * download paths below are unreachable in the product; the constant stays
+ * populated because the resolver and the CDN fallbacks are still shipped code —
+ * and still tested — as the proof that an untrusted manifest cannot be applied.
+ * Nothing reaches this string without a caller-supplied source, which the
+ * product never supplies.
+ */
 const REPO = 'Ebony-Vinyl/dsh-our-free-model'
 /** This package's own name, as a package manager records it in the profile. */
 const PACKAGE_NAME = 'dsh-our-free-model'
@@ -56,28 +66,31 @@ function viaRawProxy(inner) {
   return `${RAW_PROXY}/https://raw.githubusercontent.com/${inner}`
 }
 
-/** Discovery locations, in preference order. Official mutable refs are resolved
- *  to a full commit before fetching either the manifest or its files. Mirrors
- *  remain untrusted: only the existing Ed25519 signature authorizes content. */
-export const DEFAULT_MANIFEST_SOURCES = [
-  `https://raw.githubusercontent.com/${REPO}/main/feed/manifest.json`,
-  `https://cdn.jsdelivr.net/gh/${REPO}@main/feed/manifest.json`,
-  `https://gcore.jsdelivr.net/gh/${REPO}@main/feed/manifest.json`,
-  viaRawProxy(`${REPO}/main/feed/manifest.json`),
-]
+/**
+ * Manifest discovery locations.
+ *
+ * **This adaptation has no update channel.** Upstream pointed these at its own
+ * GitHub repository, which meant an in-app "upgrade" would download upstream's
+ * files over this fork and silently discard every adaptation in it — including
+ * the standalone service, the credential migration and the extra protocols.
+ *
+ * The list is empty and {@link PluginUpdater} treats that as "no update channel":
+ * `check()` reports the running version and nothing else, and `apply()` refuses.
+ * There is no key this build trusts, either: `PINNED_MANIFEST_PUBLIC_KEY` is
+ * empty, so a manifest handed to the verifier by any other route is rejected.
+ * Deployments update by pulling this repository and restarting.
+ */
+export const DEFAULT_MANIFEST_SOURCES = []
 
 /**
- * The Ed25519 public key (SPKI, base64) every release manifest must be signed
- * with before it may be applied. The matching private key lives with the
- * publisher (`scripts/build-manifest.mjs` signs when pointed at it); it is
- * deliberately not in this repository, because a trust root committed beside
- * the code it authenticates authenticates nothing.
+ * The Ed25519 public key (SPKI, base64) a release manifest must be signed with.
  *
- * The sha256 per file pins content, but those hashes travel inside the manifest
- * itself — whoever forges the manifest forges the hashes. This key is the step
- * the forger cannot take.
+ * Empty in this adaptation: there is no publisher, and a key committed beside the
+ * code it authenticates authenticates nothing. An empty key makes
+ * `verifyManifestSignature` reject every manifest, which is the intended
+ * behaviour — no remote party may replace the running code.
  */
-export const PINNED_MANIFEST_PUBLIC_KEY = 'MCowBQYDK2VwAyEAeLdSVwYFyazc2PIBC0oLsvo4LghGEQz9iXIl3CqRuXI='
+export const PINNED_MANIFEST_PUBLIC_KEY = ''
 
 /** The manifest fields a signature covers, in canonical (sorted-key) JSON. */
 const SIGNED_FIELDS = ['version', 'base', 'publishedAt', 'notes', 'files', 'minSupported']
@@ -1092,8 +1105,19 @@ export class PluginUpdater {
   async check() {
     try {
       this.reconcileRecovery()
-      const { manifest, source } = await downloadManifest(this.sources(), { fetchImpl: this.deps.fetchImpl, verifyKey: this.deps.manifestPublicKey })
+      const sources = this.sources()
       const current = this.deps.runningVersion ?? this.currentVersion()
+      // No update channel in this adaptation (see DEFAULT_MANIFEST_SOURCES).
+      // Answer "nothing newer" rather than throwing: the settings page calls this
+      // on demand, and an exception there reads as a broken plugin.
+      if (sources.length === 0) {
+        this.latest = undefined
+        this.latestContentDrift = false
+        this.checkedAt = Date.now()
+        this.error = ''
+        return { available: false, current, latest: current, channel: 'none' }
+      }
+      const { manifest, source } = await downloadManifest(sources, { fetchImpl: this.deps.fetchImpl, verifyKey: this.deps.manifestPublicKey })
       if (manifest.minSupported !== undefined && current !== '' && compareVersions(current, manifest.minSupported) < 0) {
         throw new Error(`update path requires at least ${manifest.minSupported}; ${current} is installed`)
       }
@@ -1131,6 +1155,14 @@ export class PluginUpdater {
     // touched or a manifest is fetched: the in-app upgrader would be a second
     // writer on a directory pnpm replaces atomically, which corrupts the
     // install on Windows.
+    // No update channel in this adaptation: refuse before touching any state, with
+    // an answer that says why instead of a download error from an empty list.
+    if (this.sources().length === 0) {
+      throw Object.assign(
+        new Error('this build has no update channel; pull the repository and restart to update'),
+        { statusCode: 409 },
+      )
+    }
     if (isPackageManagerOwned(this.deps.pkgDir)) {
       throw Object.assign(new Error(PACKAGE_MANAGER_REFUSAL), { statusCode: 409 })
     }

@@ -43,3 +43,6 @@ packages/desktop/src-tauri/.node-license-cache/
 packages/desktop/node_modules/
 
 _audit/
+
+# Magpie updater runtime marker (0-byte cache; never commit).
+vendor/magpie/bin/.magpie-update-*

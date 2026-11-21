@@ -1,6 +1,7 @@
 import { modelAvailability } from '../../src/model-test.js'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import path from 'node:path'
 import { buildStats } from '../../src/core/stats.js'
 import { generateKey } from '../../src/forward.js'
 import { structuralRejection } from '../../src/trust.js'
@@ -14,14 +15,35 @@ import { createDesktopUpdater } from './desktop-update.mjs'
 import { createFeedback } from './feedback.mjs'
 import { DISCLAIMER, DISCLAIMER_VERSION, disclaimerAcknowledged } from '../../src/disclaimer.js'
 import { pageBridgeSource } from '../../src/plugins.js'
+import {
+  MigrationError, applyBackup, buildBackupPayload, exportBackup, readDshAccountState,
+  readDshCredentials, resolveDshHome, validateBackupPayload,
+} from './dsh-migrate.mjs'
+import { restrictPermissions } from '../../src/open-external.js'
+
 
 const PREFIX = '/api/management'
 const BOOTSTRAP_MS = 10 * 60_000
 const SESSION_MS = 8 * 60 * 60_000
 const MAX_BODY_BYTES = 16 * 1024
+/**
+ * The console's static surface.
+ *
+ * This adaptation replaced the prebuilt React console (which shipped upstream's
+ * branding and none of this fork's features) with a hand-written, dependency-free
+ * page. There is no build step and no asset manifest: these four files are the
+ * whole interface, and the list is a closed set — a request for anything else is
+ * a 404, so no request path is ever turned into a disk read.
+ */
 const ASSETS = new Map([
-  ['/', ['index.html', 'text/html; charset=utf-8']],
+  ['/', ['console/index.html', 'text/html; charset=utf-8']],
+  ['/assets/console.css', ['console/console.css', 'text/css; charset=utf-8']],
+  ['/assets/console.js', ['console/console.js', 'text/javascript; charset=utf-8']],
+  // The icon is the repository's own, shared with the desktop package.
+  ['/assets/icon.svg', ['../../icon.svg', 'image/svg+xml']],
 ])
+/** A page with a live session may be opened at this long-lived path. */
+const HOME_PATH = '/'
 const SECURITY_HEADERS = {
   'cache-control': 'no-store',
   'x-content-type-options': 'nosniff',
@@ -106,24 +128,126 @@ export function createManagement({ stores, runtime, channels, eac, subscriptions
   let terminalOpenedAt = null
   const loginPlatform = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'unsupported'
   const assets = new Map([...ASSETS].map(([url, [file, type]]) => [
-    url, { type, body: file === 'index.html'
-      ? Buffer.from(fs.readFileSync(new URL(`./web/${file}`, import.meta.url), 'utf8')
-        .replace('data-login-platform="unsupported"', `data-login-platform="${loginPlatform}"`))
-      : fs.readFileSync(new URL(`./web/${file}`, import.meta.url)) },
+    url, { type, body: fs.readFileSync(new URL(`./${file}`, import.meta.url)) },
   ]))
-  // 只公开构建清单中经过路径校验的 JS/CSS，绝不按请求路径读取磁盘。
-  const manifest = JSON.parse(fs.readFileSync(new URL('./web/assets.json', import.meta.url), 'utf8'))
-  if (!Array.isArray(manifest) || manifest.some(name => typeof name !== 'string' || !/^[\w-]+\.(js|css)$/.test(name))) {
-    throw new Error('独立端资源清单无效')
-  }
-  for (const name of manifest) assets.set(`/assets/${name}`, {
-    type: name.endsWith('.css') ? 'text/css; charset=utf-8' : 'text/javascript; charset=utf-8',
-    body: fs.readFileSync(new URL(`./web/${name}`, import.meta.url)),
-  })
   const json = (res, status, payload, headers = {}) => {
     res.writeHead(status, { ...SECURITY_HEADERS, 'content-type': 'application/json; charset=utf-8', ...headers })
     res.end(JSON.stringify(payload))
   }
+  /**
+   * Validate one uploaded backup document.
+   *
+   * The console hands over whatever JSON the user picked, so the shape is checked
+   * by the same contract the CLI uses before a single byte is written.
+   */
+  function buildAndValidate(payload) {
+    return validateBackupPayload(payload)
+  }
+
+  /**
+   * Persist a backup, then bring the running channel worker up to date.
+   *
+   * Two constraints found by measurement, not assumption:
+   *
+   * 1. `applyBackup` is the only step that can *drop* refs — the worker's
+   *    `backup.import` RPC merges, so importing B after A leaves both in place.
+   * 2. The RPC also rewrites the credential file from the worker's in-memory view,
+   *    so running it after a `replace` write puts the old refs straight back.
+   *
+   * Therefore: a `merge` import can use the RPC (it only adds, which is exactly
+   * what a merge wants, and it updates the live pool). A `replace` import writes
+   * the files and does *not* call the RPC — the reply reports `pending-restart`,
+   * because only a restart makes the worker forget the refs that were dropped.
+   */
+  async function applyPayloadToRunningChannels(payload, replace) {
+    const written = applyBackup(info().dataDir, payload, { replace })
+    if (channels === undefined) return { ...written, live: 'unavailable' }
+    if (replace) {
+      // See (2) above: the RPC would resurrect the refs `replace` just removed.
+      return { ...written, live: 'pending-restart' }
+    }
+    try {
+      const reply = await channels.rpc({ method: 'backup.import', payload: { payload } })
+      if (reply?.ok === true) {
+        await channels.refresh({ report: true }).catch(() => {})
+        return { ...written, live: 'applied' }
+      }
+      return { ...written, live: 'refused', liveError: String(reply?.error?.message ?? '') }
+    } catch (error) {
+      return { ...written, live: 'pending-restart', liveError: String(error?.message ?? error) }
+    }
+  }
+
+  /**
+   * Send one prompt to the local inference listener in the chosen protocol shape
+   * and return the text it answered with.
+   *
+   * Deliberately over loopback HTTP against the running listener: the console's
+   * probe must exercise what a real client would hit, including the relay's
+   * authentication, not an internal shortcut.
+   */
+  async function runProtocolProbe({ base, key, protocol, model, prompt, maxTokens, signal }) {
+    const root = base.replace(/\/+$/, '')
+    const started = Date.now()
+    const call = async (url, init) => {
+      const response = await fetch(url, { ...init, signal })
+      const text = await response.text()
+      if (!response.ok) {
+        let message = text.slice(0, 500)
+        try { message = JSON.parse(text)?.error?.message ?? message } catch { /* keep the raw body */ }
+        throw new Error(`${response.status} ${message}`)
+      }
+      return text
+    }
+    if (protocol === 'openai') {
+      const raw = await call(`${root}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] }),
+      })
+      const body = JSON.parse(raw)
+      const choice = body.choices?.[0]
+      const text = choice?.message?.content ?? choice?.message?.reasoning ?? ''
+      return { text: String(text), ms: Date.now() - started, finish: choice?.finish_reason ?? null, usage: body.usage ?? null }
+    }
+    if (protocol === 'anthropic') {
+      const raw = await call(`${root}/v1/messages`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] }),
+      })
+      const body = JSON.parse(raw)
+      const text = (body.content ?? []).filter(block => block.type === 'text').map(block => block.text).join('')
+      return { text, ms: Date.now() - started, finish: body.stop_reason ?? null, usage: body.usage ?? null }
+    }
+    if (protocol === 'gemini') {
+      const raw = await call(`${root}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        method: 'POST',
+        headers: { 'x-goog-api-key': key, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: maxTokens },
+        }),
+      })
+      const body = JSON.parse(raw)
+      const parts = body.candidates?.[0]?.content?.parts ?? []
+      const text = parts.filter(part => part.text && part.thought !== true).map(part => part.text).join('')
+      return { text, ms: Date.now() - started, finish: body.candidates?.[0]?.finishReason ?? null, usage: body.usageMetadata ?? null }
+    }
+    const raw = await call(`${root}/api/chat`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ model, stream: false, messages: [{ role: 'user', content: prompt }], options: { num_predict: maxTokens } }),
+    })
+    const body = JSON.parse(raw)
+    return {
+      text: String(body.message?.content ?? ''),
+      ms: Date.now() - started,
+      finish: body.done_reason ?? null,
+      usage: { prompt_tokens: body.prompt_eval_count, completion_tokens: body.eval_count },
+    }
+  }
+
   const cookie = req => {
     const parts = String(req.headers.cookie ?? '').split(';')
     return parts.map(value => value.trim()).find(value => value.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1)
@@ -333,6 +457,13 @@ export function createManagement({ stores, runtime, channels, eac, subscriptions
       || pathname === `${PREFIX}/extensions` || pathname.startsWith(`${PREFIX}/extensions/`)
       || pathname === `${PREFIX}/plugins` || pathname.startsWith(`${PREFIX}/plugins/`)
       || pathname === `${PREFIX}/feedback` || pathname.startsWith(`${PREFIX}/feedback/`)
+      // Credential migration reads and writes secrets, so a session created from
+      // the local API key is not enough: it needs a management-key or one-time-link
+      // session. The local key is handed to every tool on the machine, and it must
+      // not also be enough to export the account pool.
+      // `/test` is deliberately NOT here — a wire probe only spends quota on models
+      // the caller could already call directly.
+      || pathname.startsWith(`${PREFIX}/migrate/`)
     // A sandboxed plugin page inside the workspace carries a per-run HMAC
     // capability in its own path; it has an opaque origin and cannot send this
     // console's session. The engine validates the capability and serves only
@@ -680,6 +811,106 @@ export function createManagement({ stores, runtime, channels, eac, subscriptions
       if (body.probe !== undefined && typeof body.probe !== 'boolean') throw fail(400, 'probe 必须是布尔值')
       const { sources } = await runtime.refreshCatalog({ probe: body.probe === true, force: body.probe === true, report: true })
       json(res, 200, { ...summary(), sources })
+    // ── credential migration (this adaptation) ──────────────────────────────
+    //
+    // The migration itself lives in `dsh-migrate.mjs` and is also reachable from
+    // the CLI. These routes exist so the console can do it without a terminal.
+    //
+    // A successful import is applied to the *running* channel worker through its
+    // own `backup.import` RPC, so the account pool reflects the new credentials
+    // immediately instead of after a restart. When the worker is unavailable the
+    // files are still written and the reply says so.
+    } else if (method === 'POST' && pathname === `${PREFIX}/migrate/dsh`) {
+      const body = await readBody(req)
+      const dryRun = body.dryRun === true
+      let dshHome
+      try {
+        dshHome = resolveDshHome({ dshHome: typeof body.dshHome === 'string' ? body.dshHome : undefined })
+      } catch (error) { throw fail(400, `dsh 数据目录无效：${error.message}`) }
+      let payload
+      try {
+        const credentials = readDshCredentials(dshHome)
+        const state = readDshAccountState(dshHome)
+        payload = buildBackupPayload({ refs: credentials.refs, state })
+      } catch (error) {
+        if (error instanceof MigrationError || error?.name === 'CredentialYamlError') throw fail(400, error.message)
+        throw fail(500, `读取 dsh 数据目录失败：${error.message}`)
+      }
+      if (dryRun) {
+        json(res, 200, {
+          dryRun: true, source: dshHome,
+          credentialCount: Object.keys(payload.credentials).length,
+          accountCount: payload.accounts.length,
+          skipped: payload.skipped,
+        })
+        return
+      }
+      const applied = await applyPayloadToRunningChannels(payload, body.replace === true)
+      json(res, 200, {
+        dryRun: false, source: dshHome,
+        credentialCount: Object.keys(payload.credentials).length,
+        accountCount: payload.accounts.length,
+        skipped: payload.skipped,
+        written: applied,
+      })
+    } else if (method === 'POST' && pathname === `${PREFIX}/migrate/import-backup`) {
+      const body = await readBody(req, 8 * 1024 * 1024)
+      if (body.backup === null || typeof body.backup !== 'object' || Array.isArray(body.backup)) {
+        throw fail(400, '备份内容必须是 JSON 对象')
+      }
+      let payload
+      try { payload = buildAndValidate(body.backup) } catch (error) {
+        if (error instanceof MigrationError) throw fail(400, error.message)
+        throw error
+      }
+      const applied = await applyPayloadToRunningChannels(payload, body.replace !== false)
+      json(res, 200, {
+        dryRun: false,
+        credentialCount: Object.keys(payload.credentials).length,
+        accountCount: payload.accounts.length,
+        skipped: 0,
+        written: applied,
+      })
+    } else if (method === 'POST' && pathname === `${PREFIX}/migrate/export`) {
+      await readBody(req)
+      // The export is written beside the data directory, never streamed into the
+      // browser: a plaintext credential blob should not travel through a page.
+      const directory = path.join(info().dataDir, 'backups')
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      const target = path.join(directory, `ofm-backup-${stamp}.json`)
+      const payload = exportBackup(info().dataDir)
+      const temporary = `${target}.tmp`
+      fs.writeFileSync(temporary, JSON.stringify(payload, null, 2), { mode: 0o600, flag: 'wx' })
+      restrictPermissions(temporary)
+      fs.renameSync(temporary, target)
+      json(res, 200, {
+        path: target,
+        credentials: Object.keys(payload.credentials).length,
+        accounts: payload.accounts.length,
+      })
+    } else if (method === 'POST' && pathname === `${PREFIX}/test`) {
+      // One prompt, four protocols: this is the console's "does the wire work"
+      // probe. It talks to the local inference listener over loopback HTTP, so it
+      // exercises the exact surface a real client would use.
+      const body = await readBody(req)
+      if (stores.settings.get().enabled === false) throw fail(503, '推理服务已暂停，请先启用')
+      if (typeof body.model !== 'string' || body.model === '' || body.model.length > 300) throw fail(400, '请选择有效模型')
+      const protocol = typeof body.protocol === 'string' ? body.protocol : 'openai'
+      if (!['openai', 'anthropic', 'gemini', 'ollama'].includes(protocol)) throw fail(400, '不支持的协议')
+      const maxTokens = Number.isInteger(body.maxTokens) ? Math.max(16, Math.min(4096, body.maxTokens)) : 128
+      const prompt = typeof body.prompt === 'string' && body.prompt !== '' ? body.prompt.slice(0, 8000) : 'ping'
+      const controller = new AbortController()
+      const abort = () => controller.abort()
+      res.once('close', abort)
+      try {
+        const result = await runProtocolProbe({ base: info().baseUrl, key: stores.settings.get().forwardKey, protocol, model: body.model, prompt, maxTokens, signal: controller.signal })
+        if (!controller.signal.aborted) json(res, 200, result)
+      } catch (error) {
+        if (!controller.signal.aborted) throw fail(502, String(error.message ?? '试算失败'))
+      } finally {
+        res.removeListener('close', abort)
+      }
     } else if (method === 'POST' && pathname === `${PREFIX}/models/test`) {
       const body = await readBody(req)
       if (stores.settings.get().enabled === false) throw fail(503, '推理服务已暂停，请先在服务设置中启用')

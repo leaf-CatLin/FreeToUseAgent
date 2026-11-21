@@ -223,13 +223,16 @@ await checkAsync('watcher: concurrent polls share one request', async () => {
   assert.equal(a, b, 'same in-flight promise')
   fs.rmSync(dir, { recursive: true, force: true })
 })
-check('owner override is consulted first, {repo} expands', () => {
+check('an owner override is the only source, and {repo} no longer names an upstream', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ofm-feed-'))
   const store = new AnnouncementFeed({ settings: () => ({ feedUrl: 'https://my.example/{repo}/feed.json' }), cacheFile: path.join(dir, 'f.json'), onArrival: () => {} })
   const sources = store.sources()
-  assert.equal(sources[0], 'https://my.example/Ebony-Vinyl/dsh-our-free-model/feed.json')
-  assert.ok(DEFAULT_FEED_SOURCES.every(source => sources.includes(source)), 'defaults stay as fallback')
-  assert.equal(DEFAULT_FEED_SOURCES.some(source => source.includes('/master/')), false, 'defaults do not probe the removed master ref')
+  // This adaptation ships no default source: the override is the whole list, and
+  // the `{repo}` placeholder is dropped rather than expanded into an upstream
+  // repository path.
+  assert.equal(sources[0], 'https://my.example/feed.json')
+  assert.equal(sources.length, 1)
+  assert.deepEqual(DEFAULT_FEED_SOURCES, [], 'no remote announcement channel is shipped')
   fs.rmSync(dir, { recursive: true, force: true })
 })
 check('a plaintext, non-loopback override is refused (issue #19)', () => {
