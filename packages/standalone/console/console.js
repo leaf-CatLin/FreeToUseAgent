@@ -141,6 +141,11 @@ async function refresh() {
     renderOverview()
     renderLan()
     renderModels()
+    // 账号池只在面板可见时随轮询静默刷新，避免每次轮询都打满输出块。
+    const accountsPanel = document.querySelector('.panel[data-panel="accounts"]')
+    if ($('app').hidden === false && accountsPanel !== null && accountsPanel.hidden === false) {
+      void loadAccounts({ silent: true })
+    }
     setHealth(true)
   } catch (error) {
     if (error.status === 401) { showLogin('管理会话已过期，请重新登录。'); return }
@@ -283,6 +288,163 @@ function modelRow(row) {
   return tr
 }
 
+// ── 账号管理 ──────────────────────────────────────────────────────────
+
+let accountsCache = []
+
+/** 从 worker 拉全量账号（按渠道分组后摊平渲染）。 */
+async function loadAccounts({ silent = false } = {}) {
+  const out = $('accounts-out')
+  if (!silent) showOutput(out, '读取账号中…')
+  try {
+    const result = await api('/accounts/list', { method: 'POST', body: {} })
+    accountsCache = result.accounts ?? []
+    $('accounts-out').hidden = true
+    renderAccounts()
+  } catch (error) {
+    if (!silent) reportError(out, error)
+    accountsCache = []
+  }
+}
+
+function renderAccounts() {
+  const tbody = $('accounts-rows')
+  tbody.textContent = ''
+  $('accounts-status').textContent = accountsCache.length === 0
+    ? '还没有账号。先从「迁移凭据」导入，或用渠道客户端登录后使用。'
+    : `共 ${accountsCache.length} 个账号`
+
+  if (accountsCache.length === 0) {
+    const tr = el('tr')
+    const td = el('td', { colSpan: 5, className: 'muted' })
+    td.textContent = '账号池为空'
+    tr.append(td)
+    tbody.append(tr)
+    return
+  }
+
+  // 按渠道分组，渠道名显示其模型前缀（如 qoder / lobsterai）。
+  const byChannel = new Map()
+  for (const account of accountsCache) {
+    const provider = account.provider ?? 'unknown'
+    if (!byChannel.has(provider)) byChannel.set(provider, [])
+    byChannel.get(provider).push(account)
+  }
+  for (const [provider, rows] of byChannel) {
+    const head = el('tr', { className: 'channel-head' })
+    const cell = el('td', { colSpan: 5 })
+    const name = el('strong')
+    name.textContent = provider
+    cell.append(name)
+    const count = el('span', { className: 'muted' })
+    count.textContent = `　${rows.length} 个`
+    cell.append(count)
+    head.append(cell)
+    tbody.append(head)
+    for (const account of rows) tbody.append(accountRow(account, provider))
+  }
+}
+
+function accountRow(account, provider) {
+  const tr = el('tr', { className: account.enabled === false ? 'disabled' : '' })
+
+  const providerTd = el('td', { className: 'mono muted' })
+  providerTd.textContent = provider
+  tr.append(providerTd)
+
+  const nameTd = el('td')
+  nameTd.textContent = account.nickname ?? account.id
+  if (account.nickname && account.nickname !== account.id) {
+    const id = el('div', { className: 'muted' })
+    id.textContent = account.id
+    nameTd.append(id)
+  }
+  tr.append(nameTd)
+
+  const statusTd = el('td')
+  const status = el('span', { className: `tag ${account.enabled === false ? 'warn' : 'ok'}` })
+  status.textContent = account.enabled === false ? '已停用' : '可用'
+  statusTd.append(status)
+  if (account.source === 'local') {
+    const src = el('span', { className: 'tag' })
+    src.textContent = '本地'
+    statusTd.append(src)
+  }
+  tr.append(statusTd)
+
+  const expiryTd = el('td', { className: 'mono' })
+  expiryTd.textContent = account.expiresAt ? fmtExpiry(account.expiresAt) : '—'
+  if (account.expiresAt && Number(account.expiresAt) < Date.now()) expiryTd.className += ' muted-warn'
+  tr.append(expiryTd)
+
+  const actionsTd = el('td', { className: 'actions' })
+  const btn = (label, className, onClick) => {
+    const b = el('button', { className: `small ${className}`.trim() })
+    b.textContent = label
+    b.addEventListener('click', onClick)
+    actionsTd.append(b)
+  }
+  if (account.enabled === false) {
+    btn('允许', 'primary', () => setAccountEnabled(account, true))
+  } else {
+    btn('停用', 'ghost', () => setAccountEnabled(account, false))
+  }
+  if (account.refreshable !== false) {
+    btn('续期', 'ghost', () => refreshAccount(account))
+  }
+  btn('删除', 'danger', () => deleteAccount(account))
+  tr.append(actionsTd)
+
+  return tr
+}
+
+/** 相对/绝对到期时间。 */
+function fmtExpiry(value) {
+  if (typeof value === 'string') {
+    const n = Number(value)
+    if (Number.isFinite(n) && String(n) === value) value = n
+    else return value
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value)) return String(value ?? '—')
+  const when = new Date(value)
+  if (Number.isNaN(when.getTime())) return String(value)
+  const diff = when.getTime() - Date.now()
+  const rel = diff <= 0 ? '已过期' : `剩 ${Math.max(1, Math.round(diff / 86400000))} 天`
+  return `${when.toLocaleDateString('zh-CN')}（${rel}）`
+}
+
+async function setAccountEnabled(account, enabled) {
+  const out = $('accounts-out')
+  showOutput(out, `${enabled ? '允许' : '停用'}中…`)
+  try {
+    await api(`/accounts/${enabled ? 'enable' : 'disable'}`, { method: 'POST', body: { accountId: account.id } })
+    showOutput(out, enabled ? '已允许该账号。' : '已停用该账号。', 'ok')
+    await loadAccounts()
+  } catch (error) { reportError(out, error) }
+}
+
+async function refreshAccount(account) {
+  if (!confirm(`确定续期账号「${account.nickname ?? account.id}」？需要用到对应渠道的登录状态。`)) return
+  const out = $('accounts-out')
+  showOutput(out, '续期中…（可能需要几秒到几分钟）')
+  try {
+    await api('/accounts/refresh', { method: 'POST', body: { accountId: account.id } })
+    showOutput(out, '续期完成，已更新有效期。', 'ok')
+    await loadAccounts()
+  } catch (error) { reportError(out, error) }
+}
+
+async function deleteAccount(account) {
+  if (!confirm(`删除账号「${account.nickname ?? account.id}」？其凭据会一并移除，不可恢复。`)) return
+  const out = $('accounts-out')
+  showOutput(out, '删除中…')
+  try {
+    await api('/accounts/delete', { method: 'POST', body: { accountId: account.id } })
+    showOutput(out, '已删除该账号。', 'ok')
+    await loadAccounts()
+  } catch (error) { reportError(out, error) }
+}
+
 // ── 交互 ────────────────────────────────────────────────────────────────────
 
 function switchView(name) {
@@ -293,6 +455,7 @@ function switchView(name) {
     panel.hidden = panel.dataset.panel !== name
   }
   if (name === 'lan') void loadSecrets()
+  if (name === 'accounts') void loadAccounts()
 }
 
 /** 只在切到密钥页时读取密钥，读完即留在内存，不落盘。 */
@@ -321,6 +484,9 @@ function wire() {
   }
 
   $('m-search').addEventListener('input', renderModels)
+
+  // ── 账号管理 ──
+  $('btn-accounts-refresh').addEventListener('click', () => void loadAccounts())
 
   $('signout').hidden = false
   $('signout').addEventListener('click', async () => {

@@ -63,11 +63,26 @@ export class MigrationError extends Error {
 }
 
 /**
+ * 把 `~` / `~/…` / `~\…` 展开为当前用户主目录。
+ *
+ * PowerShell 与 cmd 都不会替传给 node 的参数展开 `~`，所以必须是程序自己
+ * 做，而不是依赖 shell。`~user` 形式不支持（有意保持简单）。空串原样返回
+ * 空串，让调用方继续走缺省逻辑。
+ */
+export function expandHome(value, home = os.homedir()) {
+  const text = typeof value === 'string' ? value.trim() : ''
+  if (text === '~') return home
+  if (text.startsWith('~/') || text.startsWith('~\\')) return path.join(home, text.slice(2))
+  return text
+}
+
+/**
  * 解析 dsh 数据目录：`--dsh-home` → `$DSH_HOME` → `~/.dsh`。
  */
 export function resolveDshHome({ dshHome, env = process.env, home = os.homedir() } = {}) {
   const configured = String(dshHome ?? '').trim() || (typeof env.DSH_HOME === 'string' ? env.DSH_HOME.trim() : '')
-  return configured === '' ? path.join(home, '.dsh') : path.resolve(configured)
+  const expanded = expandHome(configured, home)
+  return expanded === '' ? path.join(home, '.dsh') : path.resolve(expanded)
 }
 
 /**
@@ -75,7 +90,8 @@ export function resolveDshHome({ dshHome, env = process.env, home = os.homedir()
  */
 export function resolveStandaloneDataDir({ dataDir, env = process.env, home = os.homedir() } = {}) {
   const configured = String(dataDir ?? '').trim() || (typeof env.OFM_HOME === 'string' ? env.OFM_HOME.trim() : '')
-  return configured === '' ? path.join(home, '.our-free-model') : path.resolve(configured)
+  const expanded = expandHome(configured, home)
+  return expanded === '' ? path.join(home, '.our-free-model') : path.resolve(expanded)
 }
 
 function readJsonIfExists(file, fallback) {

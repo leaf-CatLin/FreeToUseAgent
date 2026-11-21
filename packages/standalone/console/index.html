@@ -20,6 +20,7 @@
     </div>
     <nav class="tabs" role="tablist" aria-label="主导航">
       <button role="tab" data-view="overview" aria-selected="true">概览</button>
+      <button role="tab" data-view="accounts">账号管理</button>
       <button role="tab" data-view="migrate">迁移凭据</button>
       <button role="tab" data-view="lan">局域网与密钥</button>
       <button role="tab" data-view="models">模型与试算</button>
@@ -62,6 +63,35 @@
           <dt>输出 Token</dt><dd id="f-out">—</dd>
           <dt>失败回合</dt><dd id="f-failed">—</dd>
         </dl>
+      </article>
+    </section>
+
+    <!-- ── 账号管理 ─────────────────────────────────────────────────── -->
+    <section data-panel="accounts" class="panel" hidden>
+      <article class="card">
+        <div class="card-head">
+          <div>
+            <h2>免费账号池</h2>
+            <p class="hint">查看每个渠道的账号，允许 / 停用 / 续期 / 删除。删除会连凭据一起移除，不可恢复。</p>
+          </div>
+          <button class="ghost small" id="btn-accounts-refresh">刷新</button>
+        </div>
+        <p class="hint" id="accounts-status"></p>
+        <div class="table-wrap accounts-table-wrap">
+          <table class="models accounts">
+            <thead>
+              <tr>
+                <th>渠道</th>
+                <th>账号</th>
+                <th>状态</th>
+                <th>有效期</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="accounts-rows"></tbody>
+          </table>
+        </div>
+        <pre class="output" id="accounts-out" hidden></pre>
       </article>
     </section>
 
@@ -223,7 +253,7 @@
 <!-- 登录卡片：一次性链接兑换失败或会话过期时显示 -->
 <div id="login" class="login" hidden>
   <form class="card login-card" id="login-form">
-    <img src="/assets/icon.svg" alt="" width="40" height="40">
+    <img src="/assets/icon.svg" alt="" width="46" height="46">
     <h1>登录管理台</h1>
     <p class="hint" id="login-hint">
       用启动时打印的一次性链接可以完成全部操作。手动登录时请使用

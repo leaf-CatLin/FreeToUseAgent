@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { startStandalone } from './service.mjs'
 import { restrictPermissions } from '../../src/open-external.js'
-import { formatMigrationSummary, runExportBackup, runImportBackup, runImportDsh } from './dsh-migrate.mjs'
+import { formatMigrationSummary, runExportBackup, runImportBackup, runImportDsh, expandHome } from './dsh-migrate.mjs'
 
 const usage = `Our Free Model 独立本地服务
 用法：node packages/standalone/cli.mjs [选项]
@@ -84,12 +84,12 @@ function parseArgs(argv) {
     if (flag === '--port' || flag === '--lan-port') {
       if (!/^\d+$/.test(value) || Number(value) > 65535) throw new OptionError(`端口必须为 0 到 65535 的整数：${value}`)
       options[flag === '--port' ? 'port' : 'lanPort'] = Number(value)
-    } else if (flag === '--data-dir') options.dataDir = path.resolve(value)
-    else if (flag === '--dsh-home') options.dshHome = path.resolve(value)
-    else if (flag === '--out') options.out = path.resolve(value)
-    else if (flag === '--lan-key-out') options.lanKeyOut = path.resolve(value)
-    else if (flag === '--import-backup') options.backupFile = path.resolve(value)
-    else options.exportBackupFile = path.resolve(value)
+    } else if (flag === '--data-dir') options.dataDir = path.resolve(expandHome(value))
+    else if (flag === '--dsh-home') options.dshHome = path.resolve(expandHome(value))
+    else if (flag === '--out') options.out = path.resolve(expandHome(value))
+    else if (flag === '--lan-key-out') options.lanKeyOut = path.resolve(expandHome(value))
+    else if (flag === '--import-backup') options.backupFile = path.resolve(expandHome(value))
+    else options.exportBackupFile = path.resolve(expandHome(value))
   }
   const actions = [...ACTION_FLAGS].filter(flag => seen.has(flag))
   if (actions.length > 1) throw new UsageError(`迁移动作互斥，只能选一个：${actions.join('、')}`)

@@ -464,6 +464,9 @@ export function createManagement({ stores, runtime, channels, eac, subscriptions
       // `/test` is deliberately NOT here — a wire probe only spends quota on models
       // the caller could already call directly.
       || pathname.startsWith(`${PREFIX}/migrate/`)
+      // Account lifecycle management (enable / disable / renew / delete) writes
+      // credential state, so it needs the same privileged session as migration.
+      || pathname === `${PREFIX}/accounts` || pathname.startsWith(`${PREFIX}/accounts/`)
     // A sandboxed plugin page inside the workspace carries a per-run HMAC
     // capability in its own path; it has an opaque origin and cannot send this
     // console's session. The engine validates the capability and serves only
@@ -756,6 +759,60 @@ export function createManagement({ stores, runtime, channels, eac, subscriptions
         try { json(res, 200, await channels.rpc(body, controller.signal)) }
         finally { res.removeListener('close', abort) }
       }
+    } else if (channels !== undefined && (pathname === `${PREFIX}/accounts` || pathname.startsWith(`${PREFIX}/accounts/`))) {
+      // 账号管理（查看 / 允许 / 停用 / 续期 / 删除）。
+      // 复用渠道 worker 的 account.* RPC，但套一层校验与可读错误：
+      // RPC 的失败体是 `{ ok:false, error:{ code, message } }`，直接透传会让
+      // 前端拿不到 HTTP 状态；这里统一翻译成 4xx/5xx + 可读 message。
+      const action = pathname === `${PREFIX}/accounts` ? 'list' : pathname.slice(`${PREFIX}/accounts/`.length)
+      if (method === 'POST' && action === 'list') {
+        // 列出全部账号：worker 的 `account.list` 按 provider 过滤，故遍历
+        // 已注册渠道逐个问询再扁平化。渠道未起来时返回空表。
+        const providers = channels.providers ?? []
+        const lists = await Promise.all(providers.map(provider =>
+          channels.rpc({ method: 'account.list', payload: { provider } })))
+        json(res, 200, { accounts: lists.flatMap(reply => reply?.value?.accounts ?? []) })
+      } else if (method === 'POST' && ['enable', 'disable'].includes(action)) {
+        const body = await readBody(req)
+        const accountId = String(body.accountId ?? '')
+        if (accountId === '') throw fail(400, 'accountId 必填')
+        const controller = new AbortController()
+        const abort = () => controller.abort()
+        res.once('close', abort)
+        try {
+          const reply = await channels.rpc({ method: 'account.update', payload: { accountId, patch: { enabled: action === 'enable' } } }, controller.signal)
+          if (reply?.ok !== true) throw fail(404, reply?.error?.message ?? '账号不存在或操作失败')
+          json(res, 200, { ok: true })
+        } finally { res.removeListener('close', abort) }
+      } else if (method === 'POST' && action === 'refresh') {
+        const body = await readBody(req)
+        const accountId = String(body.accountId ?? '')
+        if (accountId === '') throw fail(400, 'accountId 必填')
+        const controller = new AbortController()
+        const abort = () => controller.abort()
+        res.once('close', abort)
+        try {
+          // 续期是网络动作，可能很慢；worker 的 rpc 有长超时，这里只跟着等。
+          const reply = await channels.rpc({ method: 'account.refresh', payload: { accountId } }, controller.signal)
+          if (reply?.ok !== true) {
+            const message = reply?.error?.message ?? '续期失败'
+            throw fail(/not found|不存在/i.test(message) ? 404 : 502, message)
+          }
+          json(res, 200, { ok: true })
+        } finally { res.removeListener('close', abort) }
+      } else if (method === 'POST' && action === 'delete') {
+        const body = await readBody(req)
+        const accountId = String(body.accountId ?? '')
+        if (accountId === '') throw fail(400, 'accountId 必填')
+        const controller = new AbortController()
+        const abort = () => controller.abort()
+        res.once('close', abort)
+        try {
+          const reply = await channels.rpc({ method: 'account.delete', payload: { accountId } }, controller.signal)
+          if (reply?.ok !== true) throw fail(404, reply?.error?.message ?? '账号不存在或删除失败')
+          json(res, 200, { ok: true })
+        } finally { res.removeListener('close', abort) }
+      } else throw fail(404, '账号操作不存在')
     } else if (eac && pathname.startsWith(`${PREFIX}/eac/`)) {
       const params = new URL(req.url, 'http://localhost').searchParams
       const route = pathname.slice(PREFIX.length)

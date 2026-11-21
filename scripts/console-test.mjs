@@ -15,6 +15,26 @@ import path from 'node:path'
 const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ofm-console-')))
 const dataDir = path.join(scratch, 'data')
 
+// ── 账号池 fixture ──────────────────────────────────────────────────────────
+// worker 启动时从 `channel-pack/state.json` 载入账号池，所以预写一个 qoder
+// 账号供账号管理用例使用。刻意**不写** `channel-credentials.json`：迁移的
+// dry-run 用例断言它不存在，且 `listAccounts` 缺凭据时只跳过 `source` 字段。
+// `refreshable: false` 防止 worker 启动的批量续期定时器对 fixture 出网。
+try {
+  fs.mkdirSync(path.join(dataDir, 'channel-pack'), { recursive: true })
+  fs.writeFileSync(path.join(dataDir, 'channel-pack', 'state.json'), JSON.stringify({
+    accounts: [{
+      id: 'qoder-test-1', provider: 'qoder', nickname: '测试号', enabled: true,
+      credentialRef: 'QODER_ACCOUNT_TESTAAA', refreshable: false,
+      createdAt: Date.now(), expiresAt: Date.now() + 30 * 86400000,
+    }],
+    disabledModels: {}, gatewayEnabled: true, providerOrder: ['qoder'],
+  }))
+} catch (error) {
+  console.error(`预写账号池 fixture 失败：${error.message}`)
+  process.exit(1)
+}
+
 // ── 本机上游替身：最小的 OpenAI 兼容网关 ────────────────────────────────────
 import http from 'node:http'
 const model = 'mimo-v2.6-flash-free'
@@ -169,6 +189,77 @@ try {
     await request('/api/management/settings', { cookie, body: { standaloneLanEnabled: false } })
   })
 
+  // ── 账号管理 ────────────────────────────────────────────────────────────
+  await check('账号列表：返回 worker 池里的账号，带状态字段', async () => {
+    const r = await request('/api/management/accounts/list', { cookie, body: {} })
+    assert.equal(r.status, 200, r.text)
+    const accounts = r.value.accounts ?? []
+    const target = accounts.find(a => a.id === 'qoder-test-1')
+    assert.ok(target, `应立即看到 fixture 账号，实际 ${JSON.stringify(accounts.map(a => a.id))}`)
+    assert.equal(target.enabled, true)
+    assert.equal(target.provider, 'qoder')
+    assert.equal(target.credentialRef, 'QODER_ACCOUNT_TESTAAA')
+    assert.equal(typeof target.expiresAt, 'number')
+    // fixture 没写凭据文件，describe 失败应跳过 source；不构成列表错误。
+    assert.ok(['string', 'undefined'].includes(typeof target.source))
+  })
+
+  await check('停用 → 确认 enabled=false，重复停用幂等', async () => {
+    const r = await request('/api/management/accounts/disable', { cookie, body: { accountId: 'qoder-test-1' } })
+    assert.equal(r.status, 200, r.text)
+    const list = await request('/api/management/accounts/list', { cookie, body: {} })
+    assert.equal(list.value.accounts.find(a => a.id === 'qoder-test-1').enabled, false)
+    const again = await request('/api/management/accounts/disable', { cookie, body: { accountId: 'qoder-test-1' } })
+    assert.equal(again.status, 200, again.text)
+  })
+
+  await check('允许 → 恢复 enabled=true', async () => {
+    const r = await request('/api/management/accounts/enable', { cookie, body: { accountId: 'qoder-test-1' } })
+    assert.equal(r.status, 200, r.text)
+    const list = await request('/api/management/accounts/list', { cookie, body: {} })
+    assert.equal(list.value.accounts.find(a => a.id === 'qoder-test-1').enabled, true)
+  })
+
+  await check('续期：未知账号给 404 与可读错误', async () => {
+    const r = await request('/api/management/accounts/refresh', { cookie, body: { accountId: 'no-such-account' } })
+    assert.equal(r.status, 404, r.text)
+    assert.match(r.value.error, /not found|不存在/i)
+  })
+
+  await check('账号操作缺 accountId 一律 400', async () => {
+    for (const action of ['enable', 'disable', 'refresh', 'delete']) {
+      const r = await request(`/api/management/accounts/${action}`, { cookie, body: {} })
+      assert.equal(r.status, 400, `${action} 缺 accountId 应 400，实际 ${r.status}: ${r.text}`)
+    }
+  })
+
+  await check('删除 → 账号从池中消失', async () => {
+    const r = await request('/api/management/accounts/delete', { cookie, body: { accountId: 'qoder-test-1' } })
+    assert.equal(r.status, 200, r.text)
+    const list = await request('/api/management/accounts/list', { cookie, body: {} })
+    assert.ok(!list.value.accounts.some(a => a.id === 'qoder-test-1'), '删除后账号应消失')
+  })
+
+  await check('未知账号操作 → 404', async () => {
+    const r = await request('/api/management/accounts/dance', { cookie, body: {} })
+    assert.equal(r.status, 404, r.text)
+  })
+
+  await check('账号管理需要管理密钥会话；本机 Key 会话一律 403', async () => {
+    const unprivileged = await request('/api/management/session', { body: { key } })
+    const localCookie = unprivileged.headers.get('set-cookie').split(';')[0]
+    for (const [route, body] of [
+      ['/api/management/accounts/list', {}],
+      ['/api/management/accounts/enable', { accountId: 'x' }],
+      ['/api/management/accounts/disable', { accountId: 'x' }],
+      ['/api/management/accounts/refresh', { accountId: 'x' }],
+      ['/api/management/accounts/delete', { accountId: 'x' }],
+    ]) {
+      const r = await request(route, { cookie: localCookie, body })
+      assert.equal(r.status, 403, `${route} 需要管理密钥会话`)
+    }
+  })
+
   // ── 迁移 ────────────────────────────────────────────────────────────────
   await check('迁移演练只报计数；缺少 dsh 目录时给出可读错误', async () => {
     const missing = await request('/api/management/migrate/dsh', { cookie, body: { dryRun: true, dshHome: path.join(scratch, 'absent') } })
@@ -192,6 +283,11 @@ try {
       disabledModels: {},
     }))
 
+    // 演练不写文件：dry-run 之后凭据库内容必须与之前完全一致。账号管理
+    // 用例（删除账号时 unset 凭据）可能已留下空凭据库文件，这里只看 diff。
+    const credentialsFile = path.join(dataDir, 'channel-credentials.json')
+    const beforeBytes = fs.existsSync(credentialsFile) ? fs.readFileSync(credentialsFile, 'utf8') : null
+
     const preview = await request('/api/management/migrate/dsh', { cookie, body: { dshHome, dryRun: true } })
     assert.equal(preview.status, 200, preview.text)
     assert.equal(preview.value.dryRun, true)
@@ -199,8 +295,8 @@ try {
     assert.equal(preview.value.accountCount, 1)
     assert.equal(preview.value.skipped, 1, '平台 Key 被跳过')
 
-    // 演练不写文件。
-    assert.equal(fs.existsSync(path.join(dataDir, 'channel-credentials.json')), false)
+    // dryRun 不写文件：文件不变（或仍不存在）。
+    assert.equal(fs.existsSync(credentialsFile) ? fs.readFileSync(credentialsFile, 'utf8') : null, beforeBytes)
   })
 
   await check('导入写入凭据库并热应用到运行中的渠道', async () => {
